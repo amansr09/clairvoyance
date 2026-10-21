@@ -15,6 +15,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     AIC_VOICE_FOCUS_MODEL_PATH=/app/models/voice/aic/quail_vf_2_1_l_16khz.aicmodel \
     AIC_MODEL_PATH_S=/app/models/voice/aic/quail_s_8khz.aicmodel \
     AIC_MODEL_PATH_S_16KHZ=/app/models/voice/aic/quail_s_16khz.aicmodel \
+    BREEZE_BUDDY_NOISE_MODEL_DIR=/app/models/voice/noizzen \
     UV_CACHE_DIR=/app/.uv-cache
 
 # Install system dependencies required for audio processing and compilation
@@ -60,6 +61,19 @@ RUN /app/.venv/bin/python -c "import shutil, aic_sdk; [shutil.move(aic_sdk.Model
 # Create NLTK data directory and download required data
 RUN mkdir -p /usr/local/nltk_data && \
     uv run python -m nltk.downloader punkt punkt_tab -d /usr/local/nltk_data
+
+# Noizzen noise filter: Ceva DPDFNet models (Apache-2.0; docs/NOISE_FILTER.md).
+# The build fails if a model can't be downloaded or doesn't match.
+ARG DPDFNET_URL=https://sdk.breezesdk.store/breezebuddy/models
+ARG DPDFNET_CHECKSUMS="6218f1dbd6e4bac5768c63b7d899fe7b84b3788f2a35c4e246d4ab0946165c5d  /app/models/voice/noizzen/dpdfnet2_8khz.onnx\n371d26182aff0e1e0d31354e24c81f79cd57458f5a7dd003fc10a7ebf64255e0  /app/models/voice/noizzen/dpdfnet_baseline_16khz.onnx"
+RUN mkdir -p /app/models/voice/noizzen && \
+    curl -fsSL --retry 5 --retry-all-errors -o /app/models/voice/noizzen/dpdfnet2_8khz.onnx ${DPDFNET_URL}/dpdfnet2_8khz.onnx && \
+    curl -fsSL --retry 5 --retry-all-errors -o /app/models/voice/noizzen/dpdfnet_baseline_16khz.onnx ${DPDFNET_URL}/dpdfnet_baseline_16khz.onnx && \
+    printf "${DPDFNET_CHECKSUMS}\n" | sha256sum -c -
+COPY app/ai/voice/noise_filter/noizzen/engine/ /app/app/ai/voice/noise_filter/noizzen/engine/
+RUN uv run --no-project --no-cache --with onnx==1.19.1 --with numpy==2.2.6 \
+        --with protobuf==5.29.6 --with ml-dtypes==0.5.4 --with typing-extensions==4.15.0 \
+        python app/ai/voice/noise_filter/noizzen/engine/build.py /app/models/voice/noizzen
 
 # Copy application code
 COPY . .
