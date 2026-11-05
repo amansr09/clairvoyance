@@ -607,6 +607,7 @@ class DispatchHarness:
         outcome: str,
         meta_data: Dict[str, Any],
         call_end_time: datetime,
+        expected_status: Optional[LeadCallStatus] = None,
     ) -> Optional[LeadCallTracker]:
         self.completions.append(
             {
@@ -614,9 +615,14 @@ class DispatchHarness:
                 "status": status,
                 "outcome": outcome,
                 "meta_data": meta_data,
+                "expected_status": expected_status,
             }
         )
         lead = self.leads.get(id)
+        # The real query is an atomic claim with expected_status: a lead no
+        # longer in that status is not written, and None comes back.
+        if lead and expected_status is not None and lead.status != expected_status:
+            return None
         if lead:
             lead.status = status
             lead.outcome = outcome

@@ -85,8 +85,9 @@ async def push_lead(
     try:
         result = await push_lead_handler(lead_req, service_user)
     except HTTPException as e:
-        # Blacklisted number is an expected, non-retryable skip.
-        if e.status_code == status.HTTP_403_FORBIDDEN:
+        # A blacklisted number (403) or a template the merchant switched off
+        # (409) is an expected, non-retryable skip.
+        if e.status_code in (status.HTTP_403_FORBIDDEN, status.HTTP_409_CONFLICT):
             logger.info(f"breeze {topic} {order_id} skipped: {e.detail}")
             return {"status": "skipped", "reason": str(e.detail)}
         # Config errors: log and 200 so Breeze doesn't retry forever.
