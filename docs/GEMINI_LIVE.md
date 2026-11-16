@@ -110,8 +110,8 @@ pipeline uses that same `transport.input()`. Enable per template:
 
 If the model file is not provisioned, `transport.py` logs a warning and proceeds
 without filtering. ai-coustics remains available for `"provider": "aic"`
-templates, falling back to Noizzen when it cannot run. The filter adds ~50 ms of delay (40 ms model look-ahead) —
-weigh against the min-latency goal.
+templates. Noizzen adds ~50 ms of delay (40 ms model look-ahead): weigh it against
+the min-latency goal.
 
 ## Opening line (per-template, static-only) & `dial_tone`
 

@@ -130,7 +130,7 @@
       "example": true
     },
     "provider": {
-      "description": "Noise-filter provider: 'noizzen' (in-house; use it for new templates) or 'aic' (ai-coustics; a call falls back to Noizzen when ai-coustics cannot run). New configurations must provide this together with model.",
+      "description": "Noise-filter provider: 'noizzen' (in-house; use it for new templates) or 'aic' (ai-coustics). New configurations must provide this together with model.",
       "example": "noizzen"
     },
     "model": {
@@ -217,7 +217,7 @@
       }
     },
     "noise_filter": {
-      "description": "Processes incoming audio before VAD and STT. New configurations use provider='noizzen' with model='noise_cancellation'. provider='aic' and the legacy type='aic' / 'aic_voice_focus' use ai-coustics, falling back to Noizzen when it cannot run.",
+      "description": "Processes incoming audio before VAD and STT. New configurations use provider='noizzen' with model='noise_cancellation'. provider='aic' and the legacy type='aic' / 'aic_voice_focus' use ai-coustics.",
       "example": {
         "enable": true,
         "provider": "noizzen",

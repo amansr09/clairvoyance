@@ -6,15 +6,12 @@ output, and speech after it comes back exact; every failure and overload degrade
 to passthrough without losing or repeating a sample; disabling passes the caller
 through at the same delay; a split sample never shifts the stream; the template
 alone picks the filter (noizzen gets Noizzen; aic and legacy shapes get ai-coustics,
-or Noizzen when it cannot run), AIC failures hand the call to Noizzen, AIC teardown
-leaves the event loop, and the AIC wrapper holds on every pipecat from 1.1.0 to 1.15.0.
+as before Noizzen).
 """
 
 from __future__ import annotations
 
-import asyncio
 import itertools
-import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -41,7 +38,6 @@ from app.ai.voice.agents.breeze_buddy.agent.transport import (
     TRANSPORT_TYPE_DAILY,
     TRANSPORT_TYPE_TELEPHONY,
     _create_audio_input_filter,
-    _FailOpenAICFilter,
 )
 
 # isort: on
@@ -546,31 +542,12 @@ def test_noizzen_templates_get_noizzen(provisioned, transport_type, model):
 
 
 @pytest.mark.parametrize("shape", STORED_SHAPES[1:])  # every "aic" shape
-@pytest.mark.parametrize("transport_type, model", TRANSPORT_MODELS)
-def test_aic_templates_without_a_license_still_get_a_filter(
-    provisioned, monkeypatch, shape, transport_type, model
-):
-    """No ai-coustics license (AWS builds, or a removed key): Noizzen, not silence."""
+def test_aic_templates_without_a_license_get_no_filter(provisioned, monkeypatch, shape):
+    """As before Noizzen: only provider "noizzen" picks Noizzen."""
     monkeypatch.setattr(transport.static, "BREEZE_BUDDY_AIC_LICENSE_KEY", "")
-    f = _create_audio_input_filter(_configs(**shape), transport_type)
-    assert isinstance(f, NoizzenFilter)
-    assert f._model_name == model
-
-
-def test_ai_coustics_enhancement_level_is_not_reused(provisioned, monkeypatch):
-    """AIC's level is on another scale: an aic template's Noizzen fallback ignores it."""
-    monkeypatch.setattr(transport.static, "BREEZE_BUDDY_AIC_LICENSE_KEY", "")
-    aic = _create_audio_input_filter(
-        _configs(provider="aic", model="noise_cancellation", enhancement_level=0.3),
-        TRANSPORT_TYPE_TELEPHONY,
+    assert (
+        _create_audio_input_filter(_configs(**shape), TRANSPORT_TYPE_TELEPHONY) is None
     )
-    noizzen = _create_audio_input_filter(
-        _configs(provider="noizzen", model="noise_cancellation", enhancement_level=0.3),
-        TRANSPORT_TYPE_TELEPHONY,
-    )
-    assert isinstance(aic, NoizzenFilter) and isinstance(noizzen, NoizzenFilter)
-    assert aic._mix == filter_module.DEFAULT_LEVEL
-    assert noizzen._mix == 0.3
 
 
 def test_unprovisioned_model_means_no_filter(monkeypatch, tmp_path):
@@ -627,239 +604,10 @@ def aic_ready(monkeypatch, tmp_path, provisioned):
 @pytest.mark.parametrize("shape", STORED_SHAPES[1:])  # every "aic" shape
 def test_aic_templates_get_ai_coustics(aic_ready, shape):
     f = _create_audio_input_filter(_configs(**shape), TRANSPORT_TYPE_TELEPHONY)
-    assert isinstance(f, _FailOpenAICFilter)
+    assert isinstance(f, AICFilter)
 
 
 def test_noizzen_templates_stay_on_noizzen_when_ai_coustics_is_available(aic_ready):
     cfg = _configs(provider="noizzen", model="noise_cancellation")
     f = _create_audio_input_filter(cfg, TRANSPORT_TYPE_TELEPHONY)
     assert isinstance(f, NoizzenFilter)
-
-
-def _noizzen_fallback():
-    return NoizzenFilter(model="dpdfnet2_8k", model_path=Path("unused"))
-
-
-def _aic(fallback=_noizzen_fallback) -> _FailOpenAICFilter:
-    return _FailOpenAICFilter(
-        fallback=fallback, license_key="k", model_path=Path("/nonexistent")
-    )
-
-
-async def test_refused_aic_key_at_start_hands_the_call_to_noizzen(
-    fake_load, monkeypatch
-):
-    async def refused(self, sample_rate):
-        self._aic_ready = False  # what AICFilter does when the SDK rejects the key
-
-    monkeypatch.setattr(AICFilter, "start", refused)
-    f = _aic()
-    await f.start(8000)
-    assert isinstance(f._fallback, NoizzenFilter)
-    pcm = _pcm(_speechlike(0.2))
-    out = b"".join(await _feed(f, pcm))
-    assert 0 < len(out) <= len(pcm)
-
-
-async def test_aic_failing_at_start_is_contained(fake_load, monkeypatch):
-    async def corrupt(self, sample_rate):
-        raise RuntimeError("model file corrupt")
-
-    monkeypatch.setattr(AICFilter, "start", corrupt)
-    f = _aic()
-    await f.start(8000)
-    assert isinstance(f._fallback, NoizzenFilter)
-
-
-async def test_aic_error_mid_call_switches_to_noizzen(fake_load, monkeypatch):
-    async def ok_start(self, sample_rate):
-        self._aic_ready = True
-
-    async def refused(self, audio):
-        raise RuntimeError("SDK key was not authorized")
-
-    monkeypatch.setattr(AICFilter, "start", ok_start)
-    monkeypatch.setattr(AICFilter, "filter", refused)
-    f = _aic()
-    await f.start(8000)
-    chunk = _pcm(_speechlike(0.02))
-    assert await f.filter(chunk) == chunk  # this frame passes through
-    assert isinstance(f._fallback, NoizzenFilter)  # the rest is filtered by Noizzen
-
-
-async def test_aic_failure_without_a_fallback_passes_audio_through(monkeypatch):
-    async def refused(self, sample_rate):
-        self._aic_ready = False
-
-    monkeypatch.setattr(AICFilter, "start", refused)
-    f = _aic(fallback=lambda: None)
-    await f.start(8000)
-    chunk = _pcm(_speechlike(0.02))
-    assert await f.filter(chunk) == chunk
-
-
-async def test_aic_failing_mid_call_hands_back_the_audio_it_was_holding():
-    class Processor:
-        calls = 0
-
-        async def process_async(self, block):
-            Processor.calls += 1
-            if Processor.calls > 1:
-                raise RuntimeError("SDK key was not authorized")
-            return block.copy()
-
-    f = _aic(fallback=lambda: None)
-    f._processor, f._aic_ready, f._sample_rate = Processor(), True, 8000
-    f._frames_per_block = 80
-    f._in_f32 = np.zeros((1, 80), dtype=np.float32)
-    f._out_i16 = np.zeros(80, dtype=np.int16)
-    held = _pcm(_speechlike(0.005))  # half a block: buffered, not yet processed
-    assert await f.filter(held) == b""
-    chunk = _pcm(_speechlike(0.02))
-    assert await f.filter(chunk) == held + chunk  # the second block fails
-    assert not f._audio_buffer
-
-
-async def test_aic_cleanup_failing_at_call_end_is_contained():
-    class Context:
-        def reset(self):
-            raise RuntimeError("SDK key was not authorized")
-
-    stopped = []
-
-    async def stop_fallback():
-        stopped.append(True)
-
-    f = _aic()
-    f._processor_ctx = Context()
-    f._fallback = cast(Any, SimpleNamespace(stop=stop_fallback))
-    await f.stop()  # must not raise
-    await f.stop()  # the transport can stop it again
-    assert f._processor_ctx is None
-    assert len(stopped) == 2
-
-
-def _native_handle(freed_on: list):
-    class NativeHandle:
-        def __del__(self):
-            freed_on.append(threading.current_thread() is threading.main_thread())
-
-    return NativeHandle()
-
-
-async def test_aic_teardown_runs_off_the_event_loop():
-    freed_on: list = []
-    f = _aic()
-    f._processor = _native_handle(freed_on)
-    await f.stop()
-    assert freed_on == [False]
-
-
-def test_aic_filter_still_has_what_the_wrapper_reads():
-    """The private AICFilter state _FailOpenAICFilter reads, unchanged in pipecat
-    1.1.0-1.15.0. If an upgrade fails this, the wrapper still never raises, but it
-    can no longer see a refused key at start or hand back held audio: update it."""
-    f = AICFilter(license_key="key", model_path=Path("model.aicmodel"))
-    assert f._aic_ready is False
-    assert isinstance(f._audio_buffer, bytearray)
-    assert f._processor is None and f._processor_ctx is None
-
-
-async def test_aic_filter_passes_audio_through_while_not_ready():
-    """What the wrapper relies on once it marks AIC not ready without a fallback."""
-    f = AICFilter(license_key="key", model_path=Path("model.aicmodel"))
-    assert await f.filter(b"\x01\x02\x03\x04") == b"\x01\x02\x03\x04"
-
-
-async def test_aic_stop_works_without_vad_ctx():
-    """pipecat 1.8.0 dropped AICFilter._vad_ctx: stopping must neither raise nor
-    free the handles on the event loop."""
-    freed_on: list = []
-    f = _aic()
-    if hasattr(f, "_vad_ctx"):
-        del f._vad_ctx  # as on pipecat 1.8 and later
-    f._processor = _native_handle(freed_on)
-    await f.stop()
-    assert freed_on == [False]
-
-
-async def test_control_frames_reach_noizzen_after_the_fallback(fake_load, monkeypatch):
-    async def refused(self, sample_rate):
-        self._aic_ready = False
-
-    monkeypatch.setattr(AICFilter, "start", refused)
-    f = _aic()
-    await f.start(8000)
-    noizzen = f._fallback
-    assert isinstance(noizzen, NoizzenFilter)
-    await f.process_frame(FilterEnableFrame(enable=False))
-    assert noizzen._enabled is False
-
-
-async def test_aic_is_released_when_the_call_moves_to_noizzen(fake_load, monkeypatch):
-    """A mid-call failure ends the AIC session then, not at call end, and still
-    frees it off the event loop; the call end frees nothing twice."""
-    freed_on: list = []
-
-    async def ok_start(self, sample_rate):
-        self._aic_ready, self._processor = True, _native_handle(freed_on)
-
-    async def refused(self, audio):
-        raise RuntimeError("SDK key was not authorized")
-
-    monkeypatch.setattr(AICFilter, "start", ok_start)
-    monkeypatch.setattr(AICFilter, "filter", refused)
-    f = _aic()
-    await f.start(8000)
-    await f.filter(_pcm(_speechlike(0.02)))
-    assert isinstance(f._fallback, NoizzenFilter)
-    assert f._release is not None
-    await f._release  # runs in the background
-    assert freed_on == [False] and f._processor is None
-    await f.stop()
-    assert freed_on == [False]
-
-
-@pytest.mark.parametrize("slow", ["native teardown", "session end"])
-async def test_a_mid_call_aic_failure_does_not_hold_up_the_audio(
-    fake_load, monkeypatch, slow
-):
-    """AIC's teardown can wait seconds on its usage report (a native destructor on
-    pipecat 1.1, an awaited session end on 1.8+). The caller's audio must not wait:
-    Noizzen takes over at once, and the call end waits for the teardown instead."""
-    freed: list = []
-
-    class SlowHandle:
-        def __del__(self):
-            if slow == "native teardown":
-                time.sleep(1.0)
-            freed.append(True)
-
-    original_stop = AICFilter.stop
-
-    async def slow_stop(self):
-        if slow == "session end":
-            await asyncio.sleep(1.0)
-        await original_stop(self)
-
-    async def ok_start(self, sample_rate):
-        self._aic_ready, self._processor = True, SlowHandle()
-
-    async def refused(self, audio):
-        raise RuntimeError("failed to report usage. Check your internet connection")
-
-    monkeypatch.setattr(AICFilter, "start", ok_start)
-    monkeypatch.setattr(AICFilter, "filter", refused)
-    monkeypatch.setattr(AICFilter, "stop", slow_stop)
-    f = _aic()
-    await f.start(8000)
-    chunk = _pcm(_speechlike(0.02))
-    began = time.perf_counter()
-    assert await f.filter(chunk) == chunk
-    assert time.perf_counter() - began < 0.5  # not the 1 s teardown
-    assert isinstance(f._fallback, NoizzenFilter)
-    assert (
-        sum(map(len, await _feed(f, _pcm(_speechlike(0.1))))) > 0
-    )  # Noizzen meanwhile
-    await f.stop()
-    assert freed == [True]

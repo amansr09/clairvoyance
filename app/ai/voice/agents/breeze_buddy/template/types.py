@@ -849,7 +849,7 @@ class NoiseFilterType(str, Enum):
 class NoiseFilterProvider(str, Enum):
     """Audio-filter integrations available to the voice pipeline."""
 
-    AIC = "aic"  # ai-coustics; a call falls back to Noizzen when it cannot run
+    AIC = "aic"  # ai-coustics
     NOIZZEN = "noizzen"  # in-house noise filter, app/ai/voice/noise_filter/noizzen
 
 
@@ -882,9 +882,8 @@ class NoiseFilterConfig(BaseModel):
     )
     provider: Optional[NoiseFilterProvider] = Field(
         None,
-        description="Noise-filter provider: 'noizzen' (in-house; use it for new templates) or "
-        "'aic' (ai-coustics; a call falls back to Noizzen when ai-coustics cannot "
-        "run).",
+        description="Noise-filter provider: 'noizzen' (in-house; use it for new "
+        "templates) or 'aic' (ai-coustics).",
         exclude_if=lambda value: value is None,
     )
     model: Optional[NoiseFilterModel] = Field(

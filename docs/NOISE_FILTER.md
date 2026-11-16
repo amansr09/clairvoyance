@@ -23,7 +23,7 @@ The template alone decides which filter a call gets:
 | Template `noise_filter` | Filter |
 | --- | --- |
 | `provider: "noizzen"` | Noizzen |
-| `provider: "aic"`, or the legacy `type` | ai-coustics; when it cannot run (no license key, missing model, a refused key at start or mid-call), that call falls back to Noizzen |
+| `provider: "aic"`, or the legacy `type` | ai-coustics, as before (no license key or model: no filter) |
 
 Rollout: a deploy changes nothing for existing templates. Move a template to Noizzen
 by setting its `provider` to `"noizzen"`, and back by setting it to `"aic"`; the
@@ -161,6 +161,6 @@ ran through its production class, in 20 ms chunks.
 
 When the ai-coustics licence ends: delete its model files
 (`gs://breeze-clairvoyance-models/aic`, Docker images and caches that contain
-them), remove the Dockerfile download step, `_FailOpenAICFilter` and
-`_create_aic_filter` in `transport.py` and the `aic` pipecat extra, and map
-`provider: "aic"` templates to Noizzen.
+them), remove the Dockerfile download step, the AIC branch of
+`_create_audio_input_filter` in `transport.py` and the `aic` pipecat extra, and
+move `provider: "aic"` templates to `"noizzen"`.
