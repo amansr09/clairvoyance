@@ -15,7 +15,7 @@ from app.database.accessor.breeze_buddy.telephony_number import (
     get_telephony_number_by_number,
 )
 from app.database.accessor.breeze_buddy.template import (
-    get_template_by_id,
+    get_live_template_by_id,
     get_template_by_telephony_number_id,
 )
 from app.schemas import CallDirection, CallProvider, LeadCallStatus
@@ -194,7 +194,7 @@ async def create_lead_from_template_id(
     # no-template path (handle_inbound_call) already does: an outbound-only
     # template can never be started from this socket. Legitimate outbound calls
     # never reach this function — their lead exists before the socket opens.
-    template = await get_template_by_id(template_id)
+    template = await get_live_template_by_id(template_id)
     telephony_number = await get_telephony_number_by_number(to_number)
     inbound_enabled = bool(
         getattr(getattr(template, "configurations", None), "enable_inbound", False)

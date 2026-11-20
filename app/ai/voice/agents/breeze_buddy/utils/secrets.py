@@ -197,6 +197,7 @@ def mask_template_secrets(template: TemplateModel) -> TemplateModel:
         # default (``current_version=1``) instead of the template's actual
         # lineage state.
         current_version=template.current_version,
+        published_version=template.published_version,
         name=template.name,
         flow=template.flow,
         expected_payload_schema=template.expected_payload_schema,

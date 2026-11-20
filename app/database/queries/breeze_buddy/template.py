@@ -36,7 +36,7 @@ def get_template_in_scope_query(
         SELECT id,
                reseller_id,
                merchant_id,
-               name, flow, expected_payload_schema, expected_callback_response_schema, configurations, secrets, telephony_number_id, is_active, supported_channels, current_version, created_at, updated_at
+               name, flow, expected_payload_schema, expected_callback_response_schema, configurations, secrets, telephony_number_id, is_active, supported_channels, current_version, published_version, created_at, updated_at
         FROM {TEMPLATE_TABLE}
         WHERE {" AND ".join(conditions)}
     """
@@ -74,7 +74,7 @@ def create_template_query(
     query = f"""
         INSERT INTO {TEMPLATE_TABLE} (id, reseller_id, merchant_id, name, flow, expected_payload_schema, expected_callback_response_schema, configurations, secrets, telephony_number_id, is_active, supported_channels, created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14)
-        RETURNING id, reseller_id, merchant_id, name, flow, expected_payload_schema, expected_callback_response_schema, configurations, secrets, telephony_number_id, is_active, supported_channels, current_version, created_at, updated_at
+        RETURNING id, reseller_id, merchant_id, name, flow, expected_payload_schema, expected_callback_response_schema, configurations, secrets, telephony_number_id, is_active, supported_channels, current_version, published_version, created_at, updated_at
     """
 
     return query, [
@@ -235,7 +235,7 @@ def get_template_by_id_query(template_id: str) -> Tuple[str, List[Any]]:
         SELECT id,
                reseller_id,
                merchant_id,
-               name, flow, expected_payload_schema, expected_callback_response_schema, configurations, secrets, telephony_number_id, is_active, supported_channels, current_version, created_at, updated_at
+               name, flow, expected_payload_schema, expected_callback_response_schema, configurations, secrets, telephony_number_id, is_active, supported_channels, current_version, published_version, created_at, updated_at
         FROM {TEMPLATE_TABLE}
         WHERE id = $1
         LIMIT 1
@@ -256,6 +256,32 @@ def get_merchant_by_template_id_query(template_id: str) -> Tuple[str, List[Any]]
     return query, [template_id]
 
 
+# Inbound routing reads what real calls run: a draft's published snapshot
+# content (flow, configurations, schemas), as get_live_template_by_id does.
+_LIVE_SNAPSHOT_JOIN = """
+        LEFT JOIN template_version tv
+          ON tv.template_id = t.id
+         AND tv.version = t.published_version
+         AND t.published_version IS DISTINCT FROM t.current_version"""
+
+
+def _live(column: str) -> str:
+    return f"CASE WHEN tv.version IS NULL THEN t.{column} ELSE tv.{column} END"
+
+
+_LIVE_COLUMNS = f"""t.id, t.reseller_id, t.merchant_id, t.name,
+               {_live("flow")} AS flow,
+               {_live("expected_payload_schema")} AS expected_payload_schema,
+               {_live("expected_callback_response_schema")}
+                   AS expected_callback_response_schema,
+               {_live("configurations")} AS configurations,
+               t.telephony_number_id, t.is_active, t.supported_channels,
+               COALESCE(tv.version, t.current_version) AS current_version,
+               CASE WHEN tv.version IS NULL THEN t.published_version END
+                   AS published_version,
+               t.created_at, t.updated_at"""
+
+
 def get_template_by_telephony_number_id_query(
     telephony_number_id: str,
     enable_inbound_only: bool = False,
@@ -268,21 +294,18 @@ def get_template_by_telephony_number_id_query(
         enable_inbound_only: If True, only return templates with
                              configurations.enable_inbound = true
     """
-    conditions = ["telephony_number_id = $1"]
+    conditions = ["t.telephony_number_id = $1"]
 
     if enable_inbound_only:
         # Filter by enable_inbound in configurations JSON
         # COALESCE ensures missing key defaults to FALSE
         conditions.append(
-            "COALESCE((configurations->>'enable_inbound')::boolean, FALSE) = TRUE"
+            f"COALESCE(({_live('configurations')}->>'enable_inbound')::boolean, FALSE) = TRUE"
         )
 
     query = f"""
-        SELECT id,
-               reseller_id,
-               merchant_id,
-               name, flow, expected_payload_schema, expected_callback_response_schema, configurations, secrets, telephony_number_id, is_active, supported_channels, current_version, created_at, updated_at
-        FROM {TEMPLATE_TABLE}
+        SELECT {_LIVE_COLUMNS}, t.secrets
+        FROM {TEMPLATE_TABLE} t{_LIVE_SNAPSHOT_JOIN}
         WHERE {' AND '.join(conditions)}
         LIMIT 1
     """
@@ -307,17 +330,14 @@ def get_all_templates_by_telephony_number_id_query(
     expected and by design.
     """
     query = f"""
-        SELECT id,
-               reseller_id,
-               merchant_id,
-               name, flow, expected_payload_schema, expected_callback_response_schema, configurations, telephony_number_id, is_active, supported_channels, current_version, created_at, updated_at
-        FROM {TEMPLATE_TABLE}
-        WHERE telephony_number_id = $1
-        AND is_active = TRUE
-        AND COALESCE((configurations->>'enable_inbound')::boolean, FALSE) = TRUE
-        ORDER BY 
-            COALESCE((configurations->>'ivr_priority')::integer, 999999) ASC,
-            name ASC
+        SELECT {_LIVE_COLUMNS}
+        FROM {TEMPLATE_TABLE} t{_LIVE_SNAPSHOT_JOIN}
+        WHERE t.telephony_number_id = $1
+        AND t.is_active = TRUE
+        AND COALESCE(({_live("configurations")}->>'enable_inbound')::boolean, FALSE) = TRUE
+        ORDER BY
+            COALESCE(({_live("configurations")}->>'ivr_priority')::integer, 999999) ASC,
+            t.name ASC
     """
     return query, [telephony_number_id]
 
@@ -367,6 +387,8 @@ def replace_template_query(
     merchant_id: Optional[str],
     supported_channels: List[str],
     updated_at,
+    set_published: bool = False,
+    published_version: Optional[int] = None,
 ) -> Tuple[str, List[Any]]:
     """
     Generate query to replace a template.
@@ -385,6 +407,8 @@ def replace_template_query(
         merchant_id: Merchant identifier or None
         supported_channels: Channels (voice/chat) the template is allowed on
         updated_at: Updated timestamp
+        set_published: Write ``published_version`` (else it is kept)
+        published_version: The version calls run while this one is a draft
 
     Returns:
         Tuple of (query string, values list)
@@ -403,12 +427,14 @@ def replace_template_query(
             merchant_id = $10,
             supported_channels = $11,
             current_version = current_version + 1,
-            updated_at = $12
+            updated_at = $12,
+            published_version = CASE WHEN $14::boolean THEN $15::integer
+                                     ELSE published_version END
         WHERE id = $13
         RETURNING id,
                   reseller_id,
                   merchant_id,
-                  name, flow, expected_payload_schema, expected_callback_response_schema, configurations, secrets, telephony_number_id, is_active, supported_channels, current_version, created_at, updated_at
+                  name, flow, expected_payload_schema, expected_callback_response_schema, configurations, secrets, telephony_number_id, is_active, supported_channels, current_version, published_version, created_at, updated_at
     """
 
     return query, [
@@ -425,7 +451,27 @@ def replace_template_query(
         supported_channels,
         updated_at,
         template_id,
+        set_published,
+        published_version,
     ]
+
+
+def activate_template_version_query(
+    template_id: str, current_version: int
+) -> Tuple[str, List[Any]]:
+    """Put the head live — on, and served to calls — only if it is still at
+    ``current_version``: an edit since then is a version its tests have not
+    passed. Not a new version: the content is unchanged, and a rollback never
+    restores the pause state."""
+    query = f"""
+        UPDATE {TEMPLATE_TABLE}
+        SET is_active = TRUE, published_version = NULL, updated_at = now()
+        WHERE id = $1
+          AND current_version = $2
+          AND (is_active = FALSE OR published_version IS NOT NULL)
+        RETURNING id;
+    """
+    return query, [template_id, current_version]
 
 
 def update_template_flow_and_configurations_query(
@@ -443,7 +489,7 @@ def update_template_flow_and_configurations_query(
         RETURNING id,
                   reseller_id,
                   merchant_id,
-                  name, flow, expected_payload_schema, expected_callback_response_schema, configurations, secrets, telephony_number_id, is_active, supported_channels, current_version, created_at, updated_at
+                  name, flow, expected_payload_schema, expected_callback_response_schema, configurations, secrets, telephony_number_id, is_active, supported_channels, current_version, published_version, created_at, updated_at
     """
     return query, [flow, configurations, updated_at, template_id]
 
@@ -460,6 +506,8 @@ def restore_template_head_query(
     now,
     owner_reseller_id: str,
     owner_merchant_id: Optional[str],
+    set_published: bool = False,
+    published_version: Optional[int] = None,
 ) -> Tuple[str, List[Any]]:
     """Rollback write: restore the CONTENT columns from a snapshot and bump
     current_version (rollback is itself a new version, never history surgery).
@@ -480,7 +528,11 @@ def restore_template_head_query(
     longer authorised on. Under READ COMMITTED the UPDATE blocks on the
     mover's lock and re-evaluates against the updated row, so the move loses
     the race honestly: 0 rows, which the accessor reports as the same 404 a
-    snapshot from a previous owner already gets."""
+    snapshot from a previous owner already gets.
+
+    A restore that is a draft (``published_version`` set) keeps the head's
+    secrets: real calls run the published version's flow with the head's
+    secrets, so the snapshot's older ones would break them."""
     query = f"""
         UPDATE {TEMPLATE_TABLE}
         SET name = $1,
@@ -488,17 +540,20 @@ def restore_template_head_query(
             expected_payload_schema = $3::jsonb,
             expected_callback_response_schema = $4::jsonb,
             configurations = $5::jsonb,
-            secrets = $6::jsonb,
+            secrets = CASE WHEN $12::boolean AND $13::integer IS NOT NULL
+                           THEN secrets ELSE $6::jsonb END,
             supported_channels = $7,
             current_version = current_version + 1,
-            updated_at = $8
+            updated_at = $8,
+            published_version = CASE WHEN $12::boolean THEN $13::integer
+                                     ELSE published_version END
         WHERE id = $9
           AND reseller_id IS NOT DISTINCT FROM $10
           AND merchant_id IS NOT DISTINCT FROM $11
         RETURNING id, reseller_id, merchant_id, name, flow,
                   expected_payload_schema, expected_callback_response_schema,
                   configurations, secrets, telephony_number_id, is_active,
-                  supported_channels, current_version,
+                  supported_channels, current_version, published_version,
                   created_at, updated_at
     """
     return query, [
@@ -513,4 +568,6 @@ def restore_template_head_query(
         template_id,
         owner_reseller_id,
         owner_merchant_id,
+        set_published,
+        published_version,
     ]

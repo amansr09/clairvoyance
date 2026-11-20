@@ -127,7 +127,8 @@ def get_template_version_snapshot_query(
 def prune_template_versions_query(
     template_id: str, current_version: int, keep: int
 ) -> Tuple[str, List[Any]]:
-    """Retention: keep only the newest ``keep`` versions of a template.
+    """Retention: keep only the newest ``keep`` versions of a template, and
+    the published one, whose snapshot calls run while the head is a draft.
 
     Runs in the same transaction as the snapshot insert, so the table
     self-maintains -- no cron, no trigger.
@@ -136,5 +137,8 @@ def prune_template_versions_query(
         DELETE FROM {TEMPLATE_VERSION_TABLE} tv
         WHERE tv.template_id = $1
           AND tv.version <= $2::integer - $3::integer
+          AND tv.version IS DISTINCT FROM (
+              SELECT published_version FROM template WHERE id = $1
+          )
     """
     return query, [template_id, current_version, keep]

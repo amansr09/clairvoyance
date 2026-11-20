@@ -73,6 +73,7 @@ from .breeze_buddy.telephony_number import (
 )
 from .breeze_buddy.template import (
     create_template,
+    get_live_template_by_id,
     get_template_by_id,
     get_template_in_scope,
 )
@@ -85,6 +86,7 @@ __all__ = [
     "check_blacklisted_number",
     "mask_phone",
     "create_template",
+    "get_live_template_by_id",
     "get_template_by_id",
     "get_template_in_scope",
     "create_telephony_number",

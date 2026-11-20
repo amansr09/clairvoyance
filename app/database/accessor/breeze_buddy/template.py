@@ -13,6 +13,7 @@ from app.ai.voice.agents.breeze_buddy.template.types import (
 from app.core.logger import logger
 from app.database import db_connection
 from app.database.accessor.breeze_buddy.template_version import (
+    get_template_version,
     insert_template_version_on_conn,
 )
 from app.database.decoder.breeze_buddy.template import decode_template
@@ -21,6 +22,7 @@ from app.database.queries.breeze_buddy.call_execution_config import (
     get_reseller_id_by_merchant_identifier_from_config_query,
 )
 from app.database.queries.breeze_buddy.template import (
+    activate_template_version_query,
     check_template_usage_query,
     create_template_query,
     delete_template_if_not_referenced_query,
@@ -317,6 +319,47 @@ async def get_template_by_id(template_id: str) -> Optional[TemplateModel]:
         return None
 
 
+async def get_live_template_by_id(template_id: str) -> Optional[TemplateModel]:
+    """The template as real calls run it.
+
+    While the head is a draft waiting for its agent tests, calls run the
+    published version: its content (flow, configurations, both schemas) under
+    the head's identity, secrets, number and pause state. A published snapshot
+    that cannot be read serves the head, logged: the call goes on."""
+    template = await get_template_by_id(template_id)
+    published = template.published_version if template else None
+    if not template or published is None or not template.is_draft:
+        return template
+    try:
+        found = await get_template_version(
+            str(template.id), published, template.reseller_id, template.merchant_id
+        )
+    except Exception as e:
+        logger.error(
+            f"Error reading version {published} of template {template_id}: {e}"
+        )
+        found = None
+    if not found:
+        logger.error(
+            f"Published version {published} of template {template_id} is "
+            "unreadable; serving its draft head"
+        )
+        return template
+    snapshot, _ = found
+    return template.model_copy(
+        update={
+            "flow": snapshot.flow,
+            "configurations": snapshot.configurations,
+            "expected_payload_schema": snapshot.expected_payload_schema,
+            "expected_callback_response_schema": (
+                snapshot.expected_callback_response_schema
+            ),
+            "current_version": published,
+            "published_version": None,
+        }
+    )
+
+
 async def get_template_merchant_id(template_id: str) -> Optional[str]:
     """Return only the merchant that owns a template.
 
@@ -361,6 +404,8 @@ async def replace_template(
     changed_by: Optional[str] = None,
     change_source: str = "manual_edit",
     bulk_op_id: Optional[str] = None,
+    set_published: bool = False,
+    published_version: Optional[int] = None,
 ) -> Optional[TemplateModel]:
     """
     Update an existing template.
@@ -379,6 +424,8 @@ async def replace_template(
         is_active: Whether template is active (required)
         merchant_id: Merchant identifier (optional, set to NULL if not provided)
         now: Current timestamp
+        set_published: Write ``published_version`` with the content (else kept)
+        published_version: The version calls run while this one is a draft
 
     Returns:
         Updated TemplateModel if successful, None otherwise
@@ -421,6 +468,8 @@ async def replace_template(
             merchant_id,
             supported_channels or ["voice"],
             now,
+            set_published,
+            published_version,
         )
 
         async with db_connection() as conn:
@@ -444,6 +493,18 @@ async def replace_template(
     except Exception as e:
         logger.error(f"Error updating template: {e}", exc_info=True)
         return None
+
+
+async def activate_template_version(template_id: str, current_version: int) -> bool:
+    """Turn a paused template on if it is still at ``current_version``."""
+    try:
+        query, values = activate_template_version_query(template_id, current_version)
+        return bool(await run_parameterized_query(query, values))
+    except Exception as e:
+        logger.opt(exception=True).error(
+            f"Error activating template {template_id}: {e}"
+        )
+        raise
 
 
 async def update_template_flow_and_configurations(

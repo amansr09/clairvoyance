@@ -22,6 +22,10 @@
       "description": "Read-only. Monotonically increasing version number; every write appends a snapshot row to template_version. Starts at 1.",
       "example": 3
     },
+    "published_version": {
+      "description": "Read-only. The version real calls run while current_version is a draft waiting for its agent tests; null when calls run current_version. Set only by the agent-tests gate.",
+      "example": 2
+    },
     "name": {
       "description": "Human-readable display name shown in dashboards and logs.",
       "example": "COD Confirmation – Hindi+English"

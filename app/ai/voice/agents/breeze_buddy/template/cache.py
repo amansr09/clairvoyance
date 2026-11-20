@@ -1,4 +1,4 @@
-"""Redis-backed template cache (L2 only).
+"""Redis-backed template cache (L2 only), of the version real calls run.
 
 Templates are read-hot, write-rare. Without caching every chat ``/message``
 turn pays a Postgres roundtrip + Pydantic decode + a fistful of
@@ -20,7 +20,7 @@ from typing import Optional
 from app.ai.voice.agents.breeze_buddy.template.types import TemplateModel
 from app.core.logger import logger
 from app.database.accessor.breeze_buddy.template import (
-    get_template_by_id as _db_get_template_by_id,
+    get_live_template_by_id as _db_get_template_by_id,
 )
 from app.services.redis.client import get_redis_service, is_redis_configured
 

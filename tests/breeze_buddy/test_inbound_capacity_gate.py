@@ -505,7 +505,7 @@ async def _drive_ivr_block(
         return redirect_ok
 
     monkeypatch.setattr(ivr_mod, "redirect_call", fake_redirect_call)
-    monkeypatch.setattr(ivr_mod, "get_template_by_id", fake_get_template)
+    monkeypatch.setattr(ivr_mod, "get_live_template_by_id", fake_get_template)
     monkeypatch.setattr(
         ivr_mod, "get_call_execution_config_by_template_id", fake_get_config
     )
@@ -631,7 +631,7 @@ async def test_websocket_created_lead_owns_the_channel(monkeypatch):
         return make_inbound_lead()
 
     monkeypatch.setattr(ws_inbound, "get_lead_by_call_id", no_existing_lead)
-    monkeypatch.setattr(ws_inbound, "get_template_by_id", fake_get_template)
+    monkeypatch.setattr(ws_inbound, "get_live_template_by_id", fake_get_template)
     monkeypatch.setattr(ws_inbound, "get_telephony_number_by_number", fake_get_number)
     monkeypatch.setattr(ws_inbound, "create_lead_call_tracker", fake_create)
 

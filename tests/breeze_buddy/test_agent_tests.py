@@ -1,5 +1,6 @@
 """Automatic agent tests: scenario writing, the scenario runner and the checks
-on each test call's lead, and the eval route's token."""
+on each test call's lead, the eval route's token, and drafts: which version a
+call runs."""
 
 from __future__ import annotations
 
@@ -41,6 +42,11 @@ from app.ai.voice.agents.breeze_buddy.template.types import (
     TemplateModel,
 )
 from app.api.routers.breeze_buddy import eval as eval_route
+from app.database.accessor.breeze_buddy import template as template_accessor
+from app.database.queries.breeze_buddy.template import restore_template_head_query
+from app.database.queries.breeze_buddy.template_version import (
+    prune_template_versions_query,
+)
 from app.schemas.breeze_buddy.core import ExecutionMode, LeadCallStatus, LeadCallTracker
 
 TEMPLATE_ID = "11111111-1111-1111-1111-111111111111"
@@ -296,6 +302,96 @@ def test_a_blank_outcome_expects_none():
     assert BuddySpec(outcome=["", "CONFIRM"]).outcomes == ["CONFIRM"]
 
 
+# --- drafts: what real calls run ------------------------------------------------
+
+
+def _edited_flow() -> Dict[str, Any]:
+    flow = json.loads(json.dumps(FLOW))
+    flow["nodes"][0]["task_messages"][0]["content"] = "Confirm the order. Be brief."
+    return flow
+
+
+async def test_real_calls_run_the_published_versions_content(monkeypatch):
+    head = _template(
+        is_active=True,
+        current_version=4,
+        published_version=2,
+        flow=_edited_flow(),
+        secrets={"api_key": "rotated"},
+    )
+    published = _template(current_version=2)
+    monkeypatch.setattr(
+        template_accessor, "get_template_by_id", AsyncMock(return_value=head)
+    )
+    versions = AsyncMock(return_value=(published, None))
+    monkeypatch.setattr(template_accessor, "get_template_version", versions)
+
+    live = await template_accessor.get_live_template_by_id(TEMPLATE_ID)
+
+    assert live is not None
+    assert live.flow == FLOW
+    assert live.secrets == {"api_key": "rotated"}
+    assert live.is_active and not live.is_draft
+    assert (live.current_version, live.published_version) == (2, None)
+    versions.assert_awaited_once_with(TEMPLATE_ID, 2, "breeze", "shop")
+
+
+async def test_without_a_draft_real_calls_run_the_head(monkeypatch):
+    head = _template(is_active=True)
+    monkeypatch.setattr(
+        template_accessor, "get_template_by_id", AsyncMock(return_value=head)
+    )
+    versions = AsyncMock()
+    monkeypatch.setattr(template_accessor, "get_template_version", versions)
+
+    assert await template_accessor.get_live_template_by_id(TEMPLATE_ID) is head
+    versions.assert_not_awaited()
+
+
+async def test_an_unreadable_published_version_serves_the_head(monkeypatch):
+    head = _template(current_version=4, published_version=2)
+    monkeypatch.setattr(
+        template_accessor, "get_template_by_id", AsyncMock(return_value=head)
+    )
+    monkeypatch.setattr(
+        template_accessor, "get_template_version", AsyncMock(return_value=None)
+    )
+    assert await template_accessor.get_live_template_by_id(TEMPLATE_ID) is head
+
+
+def test_the_version_real_calls_run_is_never_pruned():
+    query, _ = prune_template_versions_query(TEMPLATE_ID, 20, 10)
+    assert "published_version" in query
+
+
+def test_a_restored_draft_keeps_the_secrets_real_calls_use():
+    # Real calls run the published flow with the head's secrets.
+    query, values = restore_template_head_query(
+        TEMPLATE_ID,
+        "n",
+        "{}",
+        None,
+        None,
+        None,
+        '{"k": "v2"}',
+        ["voice"],
+        None,
+        "breeze",
+        "shop",
+        True,
+        5,
+    )
+    assert "WHEN $12::boolean AND $13::integer IS NOT NULL" in query
+    assert "THEN secrets ELSE $6::jsonb END" in query
+    assert values[5] == '{"k": "v2"}'
+
+
+def test_a_head_that_is_the_published_version_is_not_a_draft():
+    assert _template(current_version=3, published_version=2).is_draft
+    assert not _template(current_version=3, published_version=3).is_draft
+    assert not _template(current_version=3).is_draft
+
+
 # --- the checklist ------------------------------------------------------------
 
 
@@ -486,6 +582,13 @@ def test_safety_situations_make_two_calls():
     assert from_mapping(wrong_person).runs == 2
     assert checklist.KINDS["off_topic"].runs == 2
     assert checklist.KINDS["busy"].runs == 1
+
+
+def test_the_template_api_reports_which_version_real_calls_run():
+    from app.ai.voice.agents.breeze_buddy.utils.secrets import mask_template_secrets
+
+    masked = mask_template_secrets(_template(current_version=4, published_version=2))
+    assert (masked.current_version, masked.published_version) == (4, 2)
 
 
 async def test_the_eval_route_refuses_every_session_while_tests_are_off(monkeypatch):

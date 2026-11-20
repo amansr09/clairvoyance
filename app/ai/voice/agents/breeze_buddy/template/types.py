@@ -3803,6 +3803,9 @@ class TemplateModel(BaseModel):
     # ReplaceTemplateRequest has extra="ignore", so GET→PUT round-trips
     # strip it automatically — do NOT add it to the request models.
     current_version: int = 1
+    # The version real calls run while the head is a draft waiting for its
+    # agent tests; None when calls run the head (scenario_tests/gate.py).
+    published_version: Optional[int] = None
 
     # Editable fields (these match ReplaceTemplateRequest field names 1:1).
     name: str
@@ -3827,6 +3830,16 @@ class TemplateModel(BaseModel):
         default_factory=_default_supported_channels,
         min_length=1,
     )
+
+    @property
+    def is_draft(self) -> bool:
+        """The head while real calls run an older, published version. The
+        template-level greeting audio and realtime opening line are the
+        published version's, so a draft's greeting is made per lead."""
+        return (
+            self.published_version is not None
+            and self.published_version != self.current_version
+        )
 
     @model_validator(mode="after")
     def _mirror_deprecated_number_id(self) -> "TemplateModel":

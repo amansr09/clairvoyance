@@ -49,7 +49,7 @@ from app.database.accessor import (
     update_lead_call_completion_details,
     update_lead_template,
 )
-from app.database.accessor.breeze_buddy.template import get_template_by_id
+from app.database.accessor.breeze_buddy.template import get_live_template_by_id
 from app.schemas import InboundBlockAction, LeadCallStatus
 from app.services.redis.client import get_redis_service
 
@@ -193,7 +193,7 @@ async def _check_deferred_inbound_policy(
     """
     try:
         # Look up template to get name, reseller_id, and telephony_number_id
-        template = await get_template_by_id(template_id)
+        template = await get_live_template_by_id(template_id)
         if not template:
             return False  # Can't enforce without template info
 

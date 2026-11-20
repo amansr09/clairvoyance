@@ -150,6 +150,8 @@ async def _rollback_on_conn(
     changed_by: Optional[str],
     change_source: str,
     bulk_op_id: Optional[str],
+    set_published: bool = False,
+    published_version: Optional[int] = None,
 ) -> Optional[TemplateModel]:
     snap_q, snap_v = get_template_version_snapshot_query(
         template_id, version, owner_reseller_id, owner_merchant_id
@@ -169,6 +171,8 @@ async def _rollback_on_conn(
         datetime.now(timezone.utc),
         owner_reseller_id,
         owner_merchant_id,
+        set_published,
+        published_version,
     )
     # None here also means "the template moved owners since the handler
     # authorised this call" — the UPDATE re-checks, so it matched no row.
@@ -192,8 +196,13 @@ async def rollback_template_to_version(
     owner_reseller_id: str,
     owner_merchant_id: Optional[str],
     changed_by: Optional[str],
+    set_published: bool = False,
+    published_version: Optional[int] = None,
 ) -> Optional[TemplateModel]:
     """Restore an older snapshot as the new head (+ new version row).
+
+    ``set_published`` writes ``published_version`` in the same statement:
+    the version calls keep running while the restored content is a draft.
 
     Owner-scoped like the reads: a snapshot written while the template
     belonged to a different reseller/merchant is not restorable, so a move
@@ -214,6 +223,8 @@ async def rollback_template_to_version(
                     changed_by,
                     "rollback",
                     None,
+                    set_published,
+                    published_version,
                 )
     except Exception as e:
         logger.error(
