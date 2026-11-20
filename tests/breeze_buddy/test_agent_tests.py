@@ -1,15 +1,19 @@
-"""Automatic agent tests: scenario writing, the scenario runner and the checks
-on each test call's lead, the eval route's token, and drafts: which version a
-call runs."""
+"""Automatic agent tests: the go-live gate, scenario writing, the suite and its
+worker, the scenario runner and the checks on each test call's lead, the eval
+route's token, and the template saves that queue runs. The live suite runs end
+to end against a server; these pin what decides a verdict and when an agent
+goes live."""
 
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException, WebSocket
@@ -22,6 +26,10 @@ from pipecat.evals.script import EvalScriptScenario, EvalSendAfter
 from pipecat.evals.simulation import EvalSimulationScenario
 
 from app.ai.voice.agents.breeze_buddy.agent.flow import load_template_config
+from app.ai.voice.agents.breeze_buddy.dispatch import alerts as dispatch_alerts
+from app.ai.voice.agents.breeze_buddy.handlers.internal import (
+    agent_transfer as transfer_handler,
+)
 from app.ai.voice.agents.breeze_buddy.managers import utils as manager_utils
 from app.ai.voice.agents.breeze_buddy.managers.utils import (
     ensure_realtime_opening_line_cached,
@@ -30,9 +38,19 @@ from app.ai.voice.agents.breeze_buddy.managers.utils import (
 from app.ai.voice.agents.breeze_buddy.scenario_tests import (
     access,
     checklist,
+    gate,
     generate,
     runner,
     scenario as scenario_module,
+    suite,
+    worker,
+)
+from app.ai.voice.agents.breeze_buddy.scenario_tests.gate import (
+    SavePlan,
+    Verdict,
+    decide_save,
+    fingerprint,
+    template_fingerprint,
 )
 from app.ai.voice.agents.breeze_buddy.scenario_tests.runner import (
     RunResult,
@@ -40,27 +58,56 @@ from app.ai.voice.agents.breeze_buddy.scenario_tests.runner import (
     _lead_failures,
 )
 from app.ai.voice.agents.breeze_buddy.scenario_tests.scenario import (
+    MAX_DURATION_S,
+    MAX_RUNS,
+    MAX_TURNS,
     BuddyScenario,
     BuddySpec,
     from_mapping,
 )
+from app.ai.voice.agents.breeze_buddy.scenario_tests.setup_check import SETUP_CHECK
 from app.ai.voice.agents.breeze_buddy.template import loader as loader_module
 from app.ai.voice.agents.breeze_buddy.template.types import (
+    CreateTemplateRequest,
+    ReplaceTemplateRequest,
     TemplateModel,
 )
 from app.ai.voice.agents.breeze_buddy.types.models import PushLeadRequest
 from app.ai.voice.llm.types import RealtimeLLMProvider
 from app.api.routers.breeze_buddy import eval as eval_route
 from app.api.routers.breeze_buddy.leads import handlers as lead_handlers
+from app.api.routers.breeze_buddy.templates import handlers as template_handlers
+from app.api.routers.breeze_buddy.templates.agent_tests import (
+    handlers as test_handlers,
+)
+from app.api.routers.breeze_buddy.templates.version import (
+    handlers as version_handlers,
+)
 from app.database.accessor.breeze_buddy import template as template_accessor
+from app.database.decoder.breeze_buddy.template import decode_template
+from app.database.queries.breeze_buddy.agent_tests import (
+    prune_agent_test_history_query,
+)
 from app.database.queries.breeze_buddy.template import restore_template_head_query
 from app.database.queries.breeze_buddy.template_version import (
     prune_template_versions_query,
+)
+from app.schemas.breeze_buddy.agent_tests import (
+    AgentTestResult,
+    AgentTestRun,
+    AgentTestRunStatus,
+    AgentTestScenario,
+    AgentTestScenarioRequest,
+    AgentTestScenarioSource,
+    AgentTestState,
+    AgentTestTrigger,
+    OverrideAgentTestsRequest,
 )
 from app.schemas.breeze_buddy.auth import UserInfo, UserRole
 from app.schemas.breeze_buddy.core import ExecutionMode, LeadCallStatus, LeadCallTracker
 
 TEMPLATE_ID = "11111111-1111-1111-1111-111111111111"
+EXAMPLES = "app/ai/voice/agents/breeze_buddy/examples/templates/*.json"
 
 FLOW: Dict[str, Any] = {
     "initial_node": "greet",
@@ -120,8 +167,256 @@ def _template(**overrides: Any) -> TemplateModel:
     return TemplateModel(**values)
 
 
+def _run(status: AgentTestRunStatus, **overrides: Any) -> AgentTestRun:
+    values: Dict[str, Any] = {
+        "id": "run-1",
+        "template_id": TEMPLATE_ID,
+        "fingerprint": template_fingerprint(_template()),
+        "template_version": 3,
+        "status": status,
+        "go_live": False,
+        "trigger": AgentTestTrigger.CREATED,
+        "created_at": datetime.now(timezone.utc),
+    }
+    values.update(overrides)
+    return AgentTestRun(**values)
+
+
 def _user(role: UserRole = UserRole.ADMIN) -> UserInfo:
     return UserInfo(id="u1", username="asha", role=role)
+
+
+# --- the gate ---------------------------------------------------------------
+
+
+def test_a_paused_agent_stays_paused_and_its_new_content_is_tested():
+    plan = decide_save(wants_live=False, was_live=False, verdict=Verdict())
+    assert plan == SavePlan(is_active=False, queue=True, go_live=False)
+
+
+def test_pausing_clears_going_live_but_never_queues_a_judged_version():
+    passed = Verdict(finished=_run(AgentTestRunStatus.PASSED))
+    assert decide_save(False, True, passed) == SavePlan(
+        is_active=False, queue=False, go_live=False
+    )
+
+
+def test_a_draft_asking_to_go_live_waits_for_its_first_run():
+    plan = decide_save(wants_live=True, was_live=False, verdict=Verdict())
+    assert plan == SavePlan(is_active=False, queue=True, go_live=True)
+
+
+def test_a_draft_goes_live_at_once_when_this_content_passed():
+    for status in (AgentTestRunStatus.PASSED, AgentTestRunStatus.OVERRIDDEN):
+        plan = decide_save(True, False, Verdict(finished=_run(status)))
+        assert plan == SavePlan(is_active=True)
+
+
+def test_a_draft_with_a_run_in_flight_points_that_run_at_going_live():
+    plan = decide_save(True, False, Verdict(pending=_run(AgentTestRunStatus.RUNNING)))
+    assert plan == SavePlan(is_active=False, go_live=True)
+
+
+def test_going_live_on_a_failed_version_is_refused():
+    plan = decide_save(True, False, Verdict(finished=_run(AgentTestRunStatus.FAILED)))
+    assert not plan.is_active and plan.refused
+
+
+def test_a_version_whose_run_broke_is_run_again_rather_than_refused():
+    plan = decide_save(True, False, Verdict(finished=_run(AgentTestRunStatus.ERROR)))
+    assert plan == SavePlan(is_active=False, queue=True, go_live=True)
+
+
+def test_a_live_agents_edit_is_a_draft_until_it_passes():
+    """Real calls keep the version they run now; the draft goes live on a pass."""
+    plan = decide_save(True, True, Verdict(), keep_serving=3)
+    assert plan == SavePlan(
+        is_active=True, published_version=3, queue=True, go_live=True
+    )
+
+
+def test_a_live_agents_failed_draft_never_reaches_real_calls():
+    failed = Verdict(finished=_run(AgentTestRunStatus.FAILED))
+    plan = decide_save(True, True, failed, keep_serving=3)
+    assert plan == SavePlan(is_active=True, published_version=3, go_live=True)
+
+
+def test_a_live_agents_edit_that_already_passed_goes_live_at_once():
+    passed = Verdict(finished=_run(AgentTestRunStatus.PASSED))
+    assert decide_save(True, True, passed, keep_serving=3) == SavePlan(is_active=True)
+
+
+def test_saving_what_real_calls_already_run_keeps_it_live():
+    """Nothing older to fall back to: a legacy live agent's rename, say."""
+    assert decide_save(True, True, Verdict()) == SavePlan(is_active=True, queue=True)
+
+
+def test_resuming_with_a_failed_draft_goes_live_on_the_published_version():
+    failed = Verdict(finished=_run(AgentTestRunStatus.FAILED))
+    plan = decide_save(True, False, failed, keep_serving=3)
+    assert plan == SavePlan(is_active=True, published_version=3, go_live=True)
+
+
+def test_pausing_keeps_the_published_version_for_when_it_resumes():
+    plan = decide_save(False, True, Verdict(), keep_serving=3)
+    assert plan == SavePlan(
+        is_active=False, published_version=3, queue=True, go_live=False
+    )
+
+
+async def test_a_live_agents_edit_keeps_real_calls_on_its_live_version(monkeypatch):
+    monkeypatch.setattr(gate, "get_live_template_by_id", AsyncMock())
+    live = _template(is_active=True, current_version=3)
+    edited = "e" * 64
+    assert await gate._serving_version(live, edited) == 3
+    assert await gate._serving_version(live, template_fingerprint(live)) is None
+    assert await gate._serving_version(_template(), edited) is None
+
+
+async def test_a_drafts_next_edit_keeps_real_calls_on_the_published_version(
+    monkeypatch,
+):
+    published = _template(is_active=True, current_version=2)
+    monkeypatch.setattr(
+        gate, "get_live_template_by_id", AsyncMock(return_value=published)
+    )
+    draft = _template(is_active=True, current_version=4, published_version=2)
+    assert await gate._serving_version(draft, "e" * 64) == 2
+    # Edited back to what real calls run: nothing is a draft any more.
+    assert await gate._serving_version(draft, template_fingerprint(published)) is None
+
+
+def test_the_state_shown_prefers_the_run_in_flight():
+    assert Verdict().state == AgentTestState.UNTESTED
+    finished = _run(AgentTestRunStatus.FAILED)
+    assert Verdict(finished=finished).state == AgentTestState.FAILED
+    pending = _run(AgentTestRunStatus.QUEUED)
+    assert Verdict(pending, finished).state == AgentTestState.QUEUED
+    overridden = Verdict(finished=_run(AgentTestRunStatus.OVERRIDDEN))
+    assert overridden.state == AgentTestState.OVERRIDDEN and overridden.green
+
+
+def test_only_phone_voice_agents_are_testable():
+    assert gate.testable(FLOW, ["voice"], None)
+    assert gate.testable(FLOW, [], None)  # no channels is a voice agent
+    # A chat agent's voice is in-widget: it never takes a phone call.
+    assert not gate.testable(FLOW, ["voice", "chat"], None)
+    assert not gate.testable(FLOW, ["chat"], None)
+    assert not gate.testable({**FLOW, "mode": "ivr"}, ["voice"], None)
+    # A test call would reach an MCP server for real.
+    mcp = {"mcp": {"servers": [{"name": "shop", "url": "https://shop.example"}]}}
+    assert not gate.testable(FLOW, ["voice"], mcp)
+    assert gate.testable(FLOW, ["voice"], {"mcp": {"servers": []}})
+
+
+async def test_the_gate_follows_the_live_flag(monkeypatch):
+    monkeypatch.setattr(gate, "AGENT_TESTS_ENABLED", AsyncMock(return_value=False))
+    assert not await gate.gated(FLOW, ["voice"], None)
+    monkeypatch.setattr(gate, "AGENT_TESTS_ENABLED", AsyncMock(return_value=True))
+    assert await gate.gated(FLOW, ["voice"], None)
+    assert not await gate.gated(FLOW, ["chat"], None)
+
+
+def test_the_fingerprint_follows_content_not_the_pause_state_or_version():
+    base = template_fingerprint(_template())
+    assert template_fingerprint(_template(is_active=True, current_version=9)) == base
+    edited = json.loads(json.dumps(FLOW))
+    edited["nodes"][0]["task_messages"][0]["content"] = "Cancel the order."
+    assert template_fingerprint(_template(flow=edited)) != base
+
+
+def test_content_about_to_be_saved_fingerprints_as_it_will_read_back():
+    """The PUT gate fingerprints the request; the suite, the saved row. Every
+    example template must give both the same value, or a passed agent could
+    never go live."""
+    checked = 0
+    for path in glob.glob(EXAMPLES):
+        data = json.load(open(path))
+        data.setdefault("reseller_id", "breeze")
+        data.setdefault("name", "example")
+        try:
+            request = CreateTemplateRequest.model_validate(data)
+        except Exception:
+            continue
+        configurations = (
+            request.configurations.model_dump(
+                exclude_none=True, mode="json", context={"reveal_secrets": True}
+            )
+            if request.configurations
+            else None
+        )
+        row = {
+            "id": TEMPLATE_ID,
+            "reseller_id": "breeze",
+            "merchant_id": None,
+            "name": "example",
+            "flow": json.dumps(request.flow),
+            "expected_payload_schema": json.dumps(request.expected_payload_schema),
+            "expected_callback_response_schema": json.dumps(
+                request.expected_callback_response_schema
+            ),
+            "configurations": json.dumps(configurations) if configurations else None,
+            "secrets": None,
+            "telephony_number_id": None,
+            "is_active": True,
+            "supported_channels": ["voice"],
+            "current_version": 1,
+            "created_at": None,
+            "updated_at": None,
+        }
+        saved = decode_template(cast(Any, row))
+        assert saved is not None
+        assert template_fingerprint(saved) == fingerprint(
+            request.flow,
+            configurations,
+            request.expected_payload_schema,
+            request.expected_callback_response_schema,
+        ), path
+        checked += 1
+    assert checked >= 10
+
+
+async def test_applying_a_pause_clears_going_live_and_queues_the_content(monkeypatch):
+    set_go_live = AsyncMock(return_value=1)
+    queue = AsyncMock(return_value=_run(AgentTestRunStatus.QUEUED))
+    monkeypatch.setattr(gate, "set_pending_agent_test_runs_go_live", set_go_live)
+    monkeypatch.setattr(gate, "queue_agent_test_run", queue)
+    template = _template()
+
+    await gate.apply_save(
+        template,
+        SavePlan(is_active=False, queue=True, go_live=False),
+        AgentTestTrigger.EDITED,
+        "asha",
+    )
+
+    set_go_live.assert_awaited_once_with(TEMPLATE_ID, None, False)
+    queue.assert_awaited_once_with(
+        TEMPLATE_ID,
+        template_fingerprint(template),
+        3,
+        False,
+        AgentTestTrigger.EDITED,
+        "asha",
+    )
+
+
+async def test_applying_go_live_marks_this_versions_run_in_flight(monkeypatch):
+    set_go_live = AsyncMock(return_value=1)
+    queue = AsyncMock()
+    monkeypatch.setattr(gate, "set_pending_agent_test_runs_go_live", set_go_live)
+    monkeypatch.setattr(gate, "queue_agent_test_run", queue)
+    template = _template()
+
+    run = await gate.apply_save(
+        template, SavePlan(is_active=False, go_live=True), AgentTestTrigger.EDITED, None
+    )
+
+    assert run is None
+    queue.assert_not_awaited()
+    set_go_live.assert_awaited_once_with(
+        TEMPLATE_ID, template_fingerprint(template), True
+    )
 
 
 # --- writing scenarios -------------------------------------------------------
@@ -266,6 +561,441 @@ async def test_a_situation_the_writer_leaves_out_fails_the_run(monkeypatch):
     assert llm.run_inference.await_count == 2
 
 
+# --- the suite ----------------------------------------------------------------
+
+
+def _scenario_row(name: str = "happy-path") -> AgentTestScenario:
+    template = _template()
+    [mapping] = generate.assemble(
+        [_written(name=name)], {}, template, checklist.checklist(template)
+    )
+    now = datetime.now(timezone.utc)
+    return AgentTestScenario(
+        id=f"scenario-{name}",
+        template_id=TEMPLATE_ID,
+        name=name,
+        scenario=mapping,
+        source="generated",
+        is_enabled=True,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _result(scenario: AgentTestScenario) -> AgentTestResult:
+    return AgentTestResult(
+        id=f"result-{scenario.name}",
+        run_id="run-1",
+        scenario_id=scenario.id,
+        scenario_name=scenario.name,
+        attempt=1,
+        status="QUEUED",
+    )
+
+
+class SuiteDb:
+    """The suite's accessors, recording what it wrote."""
+
+    def __init__(
+        self,
+        monkeypatch,
+        template: Optional[TemplateModel],
+        scenarios: List[AgentTestScenario],
+        passed: bool,
+        go_live: bool = True,
+        finish_returns_run: bool = True,
+    ):
+        self.finished: List[Any] = []
+        self.result_writes: List[Any] = []
+        self.activate = AsyncMock(return_value=True)
+        self.alert = AsyncMock()
+        self.queue = AsyncMock()
+        self.generate = AsyncMock(return_value=[])
+        self.setup = AsyncMock(return_value=[])
+        self.run_once = AsyncMock(
+            side_effect=lambda item, attempt, *a: RunResult(
+                "lead-1", passed, [] if passed else ["x"]
+            )
+        )
+
+        self.stored = list(scenarios)
+        self.listed = AsyncMock(side_effect=lambda _: self.stored)
+
+        async def write(template_id, generated, created_by):
+            self.stored = [*scenarios, _scenario_row()]
+            return [_scenario_row()]
+
+        async def finish_run(run_id, status, note=None):
+            self.finished.append((status, note))
+            if not finish_returns_run:
+                return None
+            return _run(status, go_live=go_live, note=note)
+
+        async def create_results(run_id, rows):
+            if rows[0][1] == SETUP_CHECK:
+                return [
+                    AgentTestResult(
+                        id="result-setup",
+                        run_id=run_id,
+                        scenario_name=SETUP_CHECK,
+                        attempt=1,
+                        status="QUEUED",
+                    )
+                ]
+            by_id = {s.id: s for s in [*scenarios, _scenario_row()]}
+            return [_result(by_id[scenario_id]) for scenario_id, *_ in rows]
+
+        async def finish_result(*args):
+            self.result_writes.append(args)
+
+        for name, value in {
+            "get_template_by_id": AsyncMock(return_value=template),
+            "list_agent_test_scenarios": self.listed,
+            "replace_generated_agent_test_scenarios": AsyncMock(side_effect=write),
+            "generate_scenarios": self.generate,
+            "create_agent_test_results": create_results,
+            "start_agent_test_result": AsyncMock(),
+            "finish_agent_test_result": finish_result,
+            "finish_agent_test_run": finish_run,
+            "run_once": self.run_once,
+            "setup_problems": self.setup,
+            "AGENT_TESTS_CONCURRENCY": AsyncMock(return_value=5),
+            "prune_agent_test_history": AsyncMock(),
+            "get_live_template_by_id": AsyncMock(return_value=template),
+            "queue_agent_test_run": self.queue,
+            "emit_agent_tests_alert": self.alert,
+            "get_agent_test_version_runs": AsyncMock(return_value=(None, None)),
+        }.items():
+            monkeypatch.setattr(suite, name, value)
+        # Going live is the gate's, shared with the admin override.
+        for name, value in {
+            "get_template_by_id": AsyncMock(return_value=template),
+            "activate_template_version": self.activate,
+            "invalidate_template": AsyncMock(),
+            "spawn_realtime_opening_line_regeneration": MagicMock(),
+        }.items():
+            monkeypatch.setattr(gate, name, value)
+
+
+async def test_a_passing_run_turns_the_unchanged_draft_on(monkeypatch):
+    db = SuiteDb(monkeypatch, _template(), [_scenario_row()], passed=True)
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING, go_live=True))
+
+    assert db.finished == [(AgentTestRunStatus.PASSED, None)]
+    db.activate.assert_awaited_once_with(TEMPLATE_ID, 3)
+    # The setup check, then the scenario: both recorded as passed.
+    assert [w[1] for w in db.result_writes] == [True, True]
+
+
+async def test_a_failing_run_leaves_the_draft_off(monkeypatch):
+    db = SuiteDb(monkeypatch, _template(), [_scenario_row()], passed=False)
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING, go_live=True))
+
+    assert db.finished == [(AgentTestRunStatus.FAILED, "1 of 1 scenario runs failed")]
+    db.activate.assert_not_awaited()
+
+
+async def test_a_run_not_asked_to_go_live_only_records_its_verdict(monkeypatch):
+    db = SuiteDb(
+        monkeypatch, _template(), [_scenario_row()], passed=True, go_live=False
+    )
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING))
+    db.activate.assert_not_awaited()
+
+
+async def test_a_run_the_stale_sweep_closed_never_turns_the_agent_on(monkeypatch):
+    db = SuiteDb(
+        monkeypatch,
+        _template(),
+        [_scenario_row()],
+        passed=True,
+        finish_returns_run=False,
+    )
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING, go_live=True))
+    db.activate.assert_not_awaited()
+    assert db.finished == [(AgentTestRunStatus.PASSED, None)]
+
+
+async def test_an_agent_edited_after_its_run_was_queued_is_not_tested(monkeypatch):
+    edited = json.loads(json.dumps(FLOW))
+    edited["initial_node"] = "end"
+    db = SuiteDb(monkeypatch, _template(flow=edited), [_scenario_row()], passed=True)
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING, go_live=True))
+
+    assert db.finished[0][0] == AgentTestRunStatus.CANCELLED
+    db.run_once.assert_not_awaited()
+
+
+async def test_an_agent_edited_during_its_run_does_not_go_live(monkeypatch):
+    db = SuiteDb(monkeypatch, _template(), [_scenario_row()], passed=True)
+    edited = json.loads(json.dumps(FLOW))
+    edited["initial_node"] = "end"
+    # Edited as its last call ended: the content going live is not what passed.
+    monkeypatch.setattr(
+        gate, "get_template_by_id", AsyncMock(return_value=_template(flow=edited))
+    )
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING, go_live=True))
+
+    assert db.finished == [(AgentTestRunStatus.PASSED, None)]
+    db.activate.assert_not_awaited()
+
+
+def _saved_during_the_run(monkeypatch, saved: TemplateModel) -> None:
+    reads = iter([_template(), saved])
+    monkeypatch.setattr(
+        suite, "get_template_by_id", AsyncMock(side_effect=lambda _: next(reads))
+    )
+
+
+async def test_an_agent_saved_during_its_run_gets_no_verdict(monkeypatch):
+    # Its later calls ran the new content: passing says nothing of either.
+    db = SuiteDb(monkeypatch, _template(), [_scenario_row()], passed=True)
+    edited = json.loads(json.dumps(FLOW))
+    edited["initial_node"] = "end"
+    _saved_during_the_run(monkeypatch, _template(flow=edited, current_version=4))
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING, go_live=True))
+
+    assert db.finished == [
+        (AgentTestRunStatus.CANCELLED, "The agent changed during its tests")
+    ]
+    db.queue.assert_not_awaited()
+    db.activate.assert_not_awaited()
+
+
+async def test_the_same_content_saved_during_its_run_is_run_again(monkeypatch):
+    # A pause, a rename or an undo back to it: the content still needs a verdict.
+    db = SuiteDb(monkeypatch, _template(), [_scenario_row()], passed=True)
+    _saved_during_the_run(monkeypatch, _template(current_version=4))
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING, go_live=True))
+
+    assert db.finished[0][0] == AgentTestRunStatus.CANCELLED
+    db.queue.assert_awaited_once_with(
+        TEMPLATE_ID,
+        template_fingerprint(_template()),
+        4,
+        True,
+        AgentTestTrigger.MANUAL,
+        None,
+    )
+    db.activate.assert_not_awaited()
+
+
+async def test_a_call_the_harness_broke_twice_leaves_the_run_unfinished(monkeypatch):
+    # Not a verdict on the agent: no FAILED, and going live runs it again.
+    db = SuiteDb(monkeypatch, _template(), [_scenario_row()], passed=True)
+    db.run_once.side_effect = lambda *a: RunResult(
+        "lead-1", False, ["<connect> refused"], harness_broke=True
+    )
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING, go_live=True))
+
+    assert db.run_once.await_count == 2
+    assert db.finished == [
+        (AgentTestRunStatus.ERROR, "1 of 1 test calls did not run: <connect> refused")
+    ]
+    db.activate.assert_not_awaited()
+
+
+async def test_custom_scenarios_alone_still_get_the_checklist_written(monkeypatch):
+    # One custom test must not stand in for every situation the agent meets.
+    custom = _scenario_row("my-check").model_copy(
+        update={"source": AgentTestScenarioSource.CUSTOM}
+    )
+    db = SuiteDb(monkeypatch, _template(), [custom], passed=True)
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING, go_live=True))
+
+    db.generate.assert_awaited_once()
+
+
+def test_the_missing_name_tests_blank_name_is_not_the_agents_lead_data():
+    template = _template()
+    kinds = [checklist.MISSING_NAME, checklist.HAPPY_PATH]
+    rows = []
+    for mapping in generate.assemble(
+        [_written(kind="missing_name", name="no-name"), _written()], {}, template, kinds
+    ):
+        now = datetime.now(timezone.utc)
+        rows.append(
+            AgentTestScenario(
+                id=f"scenario-{mapping['name']}",
+                template_id=TEMPLATE_ID,
+                name=mapping["name"],
+                scenario=mapping,
+                source=AgentTestScenarioSource.GENERATED,
+                is_enabled=True,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    assert rows[0].scenario["buddy"]["payload"] == {"customer_name": ""}
+    assert suite._lead_data(rows) == {}
+
+
+async def test_a_failed_result_write_stops_the_runs_other_calls(monkeypatch):
+    # Calls left running would write into a closed run, beside the next one.
+    db = SuiteDb(
+        monkeypatch,
+        _template(),
+        [_scenario_row("first"), _scenario_row("second")],
+        passed=True,
+    )
+    monkeypatch.setattr(suite, "AGENT_TESTS_CONCURRENCY", AsyncMock(return_value=1))
+    completed: List[str] = []
+
+    async def call(item, attempt, *args):
+        await asyncio.sleep(0.05)
+        completed.append(item.name)
+        return RunResult("lead-1", True)
+
+    async def finish_result(result_id, *args):
+        if result_id != "result-setup":
+            raise RuntimeError("db down")
+
+    db.run_once.side_effect = call
+    monkeypatch.setattr(suite, "finish_agent_test_result", finish_result)
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING, go_live=True))
+    await asyncio.sleep(0.2)
+
+    assert completed == ["first"]
+    assert db.finished == [(AgentTestRunStatus.ERROR, "The test run failed: db down")]
+
+
+async def test_the_first_run_writes_the_agents_scenarios(monkeypatch):
+    db = SuiteDb(monkeypatch, _template(), [], passed=True)
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING))
+    db.generate.assert_awaited_once()
+    assert db.finished == [(AgentTestRunStatus.PASSED, None)]
+
+
+async def test_a_rewrite_run_rewrites_the_generated_scenarios_and_runs_them_all(
+    monkeypatch,
+):
+    db = SuiteDb(monkeypatch, _template(), [_scenario_row()], passed=True)
+
+    await suite.run_suite(
+        _run(AgentTestRunStatus.RUNNING, trigger=AgentTestTrigger.REWRITE)
+    )
+
+    db.generate.assert_awaited_once()
+    # Custom scenarios stay, so the suite runs the stored set, not just the new.
+    assert db.listed.await_count == 2
+    assert db.finished == [(AgentTestRunStatus.PASSED, None)]
+
+
+async def test_a_run_that_breaks_is_closed_as_an_error(monkeypatch):
+    db = SuiteDb(monkeypatch, _template(), [], passed=True)
+    # Braces, as a writer's JSON carries: logging the error must not break.
+    db.generate.side_effect = ValueError('No usable scenarios in {"tests": []}')
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING))
+
+    [(status, note)] = db.finished
+    assert status == AgentTestRunStatus.ERROR and "No usable scenarios" in note
+
+
+# --- the worker ---------------------------------------------------------------
+
+
+def _patch_worker(monkeypatch, *runs: AgentTestRun, enabled: bool = True):
+    db = SimpleNamespace(
+        claim=AsyncMock(side_effect=[*runs, None]),
+        fail_stale=AsyncMock(return_value=0),
+        requeue=AsyncMock(),
+        run_suite=AsyncMock(),
+    )
+    monkeypatch.setattr(worker, "claim_next_agent_test_run", db.claim)
+    monkeypatch.setattr(worker, "fail_stale_agent_test_runs", db.fail_stale)
+    monkeypatch.setattr(worker, "requeue_agent_test_run", db.requeue)
+    monkeypatch.setattr(worker, "run_suite", db.run_suite)
+    monkeypatch.setattr(
+        worker, "AGENT_TESTS_STALE_RUN_MINUTES", AsyncMock(return_value=20)
+    )
+    monkeypatch.setattr(
+        worker, "AGENT_TESTS_POLL_INTERVAL_SECONDS", AsyncMock(return_value=5)
+    )
+    monkeypatch.setattr(worker, "AGENT_TESTS_ENABLED", AsyncMock(return_value=enabled))
+    return db
+
+
+async def test_a_worker_pass_closes_stale_runs_then_runs_every_queued_one(
+    monkeypatch,
+):
+    runs = [_run(AgentTestRunStatus.RUNNING, id="a"), _run(AgentTestRunStatus.RUNNING)]
+    db = _patch_worker(monkeypatch, *runs)
+
+    await worker.drain_agent_test_runs()
+
+    db.fail_stale.assert_awaited_once_with(20)
+    assert [c.args[0].id for c in db.run_suite.await_args_list] == ["a", "run-1"]
+
+
+async def test_nothing_runs_while_agent_tests_are_off(monkeypatch):
+    db = _patch_worker(monkeypatch, _run(AgentTestRunStatus.RUNNING), enabled=False)
+
+    await worker.drain_agent_test_runs()
+
+    db.claim.assert_not_awaited()
+    db.fail_stale.assert_not_awaited()
+
+
+async def test_turning_agent_tests_off_stops_the_backlog_after_the_current_run(
+    monkeypatch,
+):
+    runs = [_run(AgentTestRunStatus.RUNNING, id="a"), _run(AgentTestRunStatus.RUNNING)]
+    db = _patch_worker(monkeypatch, *runs)
+    monkeypatch.setattr(
+        worker, "AGENT_TESTS_ENABLED", AsyncMock(side_effect=[True, False])
+    )
+
+    await worker.drain_agent_test_runs()
+
+    assert [c.args[0].id for c in db.run_suite.await_args_list] == ["a"]
+    assert db.claim.await_count == 1
+
+
+async def test_a_run_cut_off_by_a_stopping_pod_goes_back_to_the_queue(monkeypatch):
+    db = _patch_worker(monkeypatch, _run(AgentTestRunStatus.RUNNING))
+    started = asyncio.Event()
+
+    async def suite_in_progress(run):
+        started.set()
+        await asyncio.Event().wait()
+
+    db.run_suite.side_effect = suite_in_progress
+    await worker.start_agent_tests_worker()
+    await asyncio.wait_for(started.wait(), 1)
+
+    await worker.stop_agent_tests_worker()
+
+    db.requeue.assert_awaited_once_with("run-1")
+    assert worker._task is None
+
+
+@pytest.mark.parametrize("worker_pod", [True, False])
+async def test_the_pre_stop_drain_stops_the_worker_only_on_its_pods(
+    monkeypatch, worker_pod
+):
+    from app import main
+
+    stop = AsyncMock()
+    monkeypatch.setattr(main, "ENABLE_AGENT_TESTS_WORKER", worker_pod)
+    monkeypatch.setattr(main, "stop_agent_tests_worker", stop)
+    monkeypatch.setattr(main, "_is_draining", False)
+
+    await main.drain()
+
+    assert stop.await_count == int(worker_pod)
+
+
 # --- the eval route's token ---------------------------------------------------
 
 
@@ -292,6 +1022,33 @@ def test_no_token_matches_without_a_signing_key(monkeypatch):
     assert not access.token_matches("lead-1", access.session_token("lead-1"))
 
 
+async def test_a_test_call_cannot_transfer_to_an_agent_it_cannot_test(monkeypatch):
+    # An MCP agent's tools would be called for real; the call stays put.
+    target = SimpleNamespace(
+        flow=FLOW,
+        supported_channels=["voice"],
+        configurations={"mcp": {"servers": [{"name": "shop"}]}},
+    )
+    load = AsyncMock(return_value=(target, {}))
+    monkeypatch.setattr(transfer_handler.FlowConfigLoader, "load_template", load)
+    monkeypatch.setattr(transfer_handler, "validate_template_compat", MagicMock())
+    bot = SimpleNamespace(
+        pending_transfer=None,
+        transfer_count=0,
+        is_eval_mode=True,
+        lead=_lead(status=LeadCallStatus.PROCESSING),
+    )
+    config = SimpleNamespace(
+        agent_transfer=SimpleNamespace(targets={"support": "tpl-b"}, max_transfers=1)
+    )
+
+    result = await transfer_handler.connect_to_agent(
+        cast(Any, SimpleNamespace(bot=bot)), {"target": "support"}, cast(Any, config)
+    )
+
+    assert result == {"status": "error", "error": "target cannot take a test call"}
+
+
 async def test_the_eval_route_refuses_a_session_without_its_token(monkeypatch):
     eval_bot = AsyncMock()
     monkeypatch.setattr(eval_route, "eval_bot", eval_bot)
@@ -309,12 +1066,356 @@ async def test_the_eval_route_refuses_a_session_without_its_token(monkeypatch):
     assert websocket.close.await_args.kwargs["code"] == 4003
 
 
+# --- template saves ------------------------------------------------------------
+
+
+def _patch_template_writes(monkeypatch, saved: TemplateModel) -> Dict[str, Any]:
+    mocks: Dict[str, Any] = {
+        "get_template_in_scope": AsyncMock(return_value=None),
+        "refuse_bad_provider_accounts": AsyncMock(),
+        "create_template": AsyncMock(return_value=saved),
+        "replace_template": AsyncMock(return_value=saved),
+        "get_template_by_id": AsyncMock(return_value=saved),
+        "invalidate_template": AsyncMock(),
+        "spawn_realtime_opening_line_regeneration": MagicMock(),
+        "spawn_background_task": MagicMock(),
+        "validate_template_access": MagicMock(),
+        "apply_save": AsyncMock(return_value=_run(AgentTestRunStatus.QUEUED)),
+    }
+    for name, value in mocks.items():
+        monkeypatch.setattr(template_handlers, name, value)
+    monkeypatch.setattr(gate, "AGENT_TESTS_ENABLED", AsyncMock(return_value=True))
+    return mocks
+
+
+def _request(cls, is_active: bool):
+    template = _template()
+    return cls(
+        reseller_id="breeze",
+        merchant_id="shop",
+        name="cod-confirm",
+        flow=template.flow,
+        expected_payload_schema=template.expected_payload_schema,
+        is_active=is_active,
+    )
+
+
+async def test_a_new_agent_is_saved_as_a_draft_and_its_tests_queued(monkeypatch):
+    mocks = _patch_template_writes(monkeypatch, _template())
+
+    await template_handlers.create_template_handler(
+        _request(CreateTemplateRequest, is_active=True), _user()
+    )
+
+    assert mocks["create_template"].await_args.kwargs["is_active"] is False
+    plan = mocks["apply_save"].await_args.args[1]
+    assert plan == SavePlan(is_active=False, queue=True, go_live=True)
+    assert mocks["apply_save"].await_args.args[2] == AgentTestTrigger.CREATED
+
+
+async def test_with_agent_tests_off_a_new_agent_is_saved_as_asked(monkeypatch):
+    mocks = _patch_template_writes(monkeypatch, _template())
+    monkeypatch.setattr(gate, "AGENT_TESTS_ENABLED", AsyncMock(return_value=False))
+
+    await template_handlers.create_template_handler(
+        _request(CreateTemplateRequest, is_active=True), _user()
+    )
+
+    assert mocks["create_template"].await_args.kwargs["is_active"] is True
+    mocks["apply_save"].assert_not_awaited()
+
+
+async def test_going_live_on_a_failed_version_refuses_the_save(monkeypatch):
+    mocks = _patch_template_writes(monkeypatch, _template())
+    monkeypatch.setattr(
+        gate,
+        "get_agent_test_version_runs",
+        AsyncMock(return_value=(None, _run(AgentTestRunStatus.FAILED))),
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await template_handlers.replace_template_handler(
+            TEMPLATE_ID, _request(ReplaceTemplateRequest, is_active=True), _user()
+        )
+
+    assert refused.value.status_code == 409
+    mocks["replace_template"].assert_not_awaited()
+
+
+async def test_going_live_on_a_passed_version_saves_it_live(monkeypatch):
+    mocks = _patch_template_writes(monkeypatch, _template())
+    versions = AsyncMock(return_value=(None, _run(AgentTestRunStatus.PASSED)))
+    monkeypatch.setattr(gate, "get_agent_test_version_runs", versions)
+
+    await template_handlers.replace_template_handler(
+        TEMPLATE_ID, _request(ReplaceTemplateRequest, is_active=True), _user()
+    )
+
+    versions.assert_awaited_once_with(TEMPLATE_ID, template_fingerprint(_template()))
+    assert mocks["replace_template"].await_args.kwargs["is_active"] is True
+    assert mocks["apply_save"].await_args.args[1] == SavePlan(is_active=True)
+
+
+async def test_a_failure_to_queue_tests_does_not_fail_the_save(monkeypatch):
+    mocks = _patch_template_writes(monkeypatch, _template())
+    mocks["apply_save"].side_effect = RuntimeError("db down")
+
+    response = await template_handlers.create_template_handler(
+        _request(CreateTemplateRequest, is_active=True), _user()
+    )
+
+    assert response["status"] == "success"
+
+
+async def test_a_pause_clears_going_live_even_with_agent_tests_off(monkeypatch):
+    # A run queued earlier must not turn the agent on once tests are back.
+    mocks = _patch_template_writes(monkeypatch, _template())
+    monkeypatch.setattr(gate, "AGENT_TESTS_ENABLED", AsyncMock(return_value=False))
+    order: List[str] = []
+    clear = AsyncMock(side_effect=lambda *a: order.append("clear"))
+    monkeypatch.setattr(template_handlers, "set_pending_agent_test_runs_go_live", clear)
+    mocks["replace_template"].side_effect = lambda **kw: (
+        order.append("save") or _template()
+    )
+
+    await template_handlers.replace_template_handler(
+        TEMPLATE_ID, _request(ReplaceTemplateRequest, is_active=False), _user()
+    )
+
+    clear.assert_awaited_once_with(TEMPLATE_ID, None, False)
+    assert order == ["clear", "save"]
+
+
+async def test_a_pause_that_cannot_clear_going_live_is_refused(monkeypatch):
+    mocks = _patch_template_writes(monkeypatch, _template())
+    clear = AsyncMock(side_effect=RuntimeError("db down"))
+    monkeypatch.setattr(template_handlers, "set_pending_agent_test_runs_go_live", clear)
+
+    with pytest.raises(HTTPException):
+        await template_handlers.replace_template_handler(
+            TEMPLATE_ID, _request(ReplaceTemplateRequest, is_active=False), _user()
+        )
+
+    mocks["replace_template"].assert_not_awaited()
+
+
 # --- the tests API -------------------------------------------------------------
+
+
+def _patch_template_load(monkeypatch, template: TemplateModel) -> None:
+    """The tests API loads and authorizes through the version handlers."""
+    monkeypatch.setattr(
+        version_handlers, "get_template_by_id", AsyncMock(return_value=template)
+    )
+    monkeypatch.setattr(version_handlers, "validate_template_access", MagicMock())
+
+
+async def test_only_an_admin_can_pass_a_version_by_hand(monkeypatch):
+    record = AsyncMock()
+    _patch_template_load(monkeypatch, _template())
+    monkeypatch.setattr(test_handlers, "record_agent_test_override", record)
+    monkeypatch.setattr(gate, "AGENT_TESTS_ENABLED", AsyncMock(return_value=True))
+    with pytest.raises(HTTPException) as refused:
+        await test_handlers.override_agent_tests_handler(
+            TEMPLATE_ID,
+            OverrideAgentTestsRequest(reason="checked on a real call"),
+            _user(UserRole.MERCHANT),
+        )
+    assert refused.value.status_code == 403
+    record.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "template, publishes",
+    [
+        # A live agent's failed draft: real calls move to it at once.
+        (_template(is_active=True, current_version=4, published_version=2), True),
+        # A paused agent only counts as passed; going live stays a choice.
+        (_template(is_active=False), False),
+    ],
+)
+async def test_an_admin_pass_publishes_a_live_agents_draft(
+    monkeypatch, template, publishes
+):
+    _patch_template_load(monkeypatch, template)
+    monkeypatch.setattr(gate, "AGENT_TESTS_ENABLED", AsyncMock(return_value=True))
+    monkeypatch.setattr(test_handlers, "record_agent_test_override", AsyncMock())
+    publish = AsyncMock(return_value=True)
+    monkeypatch.setattr(test_handlers, "go_live", publish)
+    monkeypatch.setattr(
+        test_handlers, "get_template_by_id", AsyncMock(return_value=template)
+    )
+    spawned = MagicMock(side_effect=lambda coro, name: coro.close())
+    monkeypatch.setattr(test_handlers, "spawn_background_task", spawned)
+
+    await test_handlers.override_agent_tests_handler(
+        TEMPLATE_ID, OverrideAgentTestsRequest(reason="checked on a real call"), _user()
+    )
+
+    assert publish.await_count == int(publishes)
+    # Every pass by hand is announced, like a template update.
+    assert spawned.call_args.kwargs["name"].startswith("agent-tests-override-alert")
+
+
+@pytest.mark.parametrize("passed, alerted", [(False, True), (True, False)])
+async def test_a_failed_run_is_announced(monkeypatch, passed, alerted):
+    db = SuiteDb(monkeypatch, _template(), [_scenario_row()], passed=passed)
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING, go_live=True))
+
+    assert db.alert.await_count == int(alerted)
+    if alerted:
+        title, *_, result, real_calls, _by = db.alert.await_args_list[0].args
+        assert title == "Breeze Buddy Agent Tests Failed"
+        assert result == "1 of 1 scenario runs failed"
+        assert real_calls == "None: the agent is paused"
+
+
+async def test_a_failure_an_admin_already_passed_is_not_announced(monkeypatch):
+    db = SuiteDb(monkeypatch, _template(), [_scenario_row()], passed=False)
+    passed_by_hand = _run(AgentTestRunStatus.OVERRIDDEN, id="run-override")
+    monkeypatch.setattr(
+        suite,
+        "get_agent_test_version_runs",
+        AsyncMock(return_value=(None, passed_by_hand)),
+    )
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING, go_live=True))
+
+    db.alert.assert_not_awaited()
+
+
+async def test_the_alert_keeps_author_text_inert(monkeypatch):
+    send = AsyncMock()
+    monkeypatch.setattr(dispatch_alerts.slack_alert, "send", send)
+
+    await dispatch_alerts.emit_agent_tests_alert(
+        "t", TEMPLATE_ID, "<!channel> agent", 3, None, "<b>", "v2", "editor"
+    )
+
+    values = [f["value"] for f in send.await_args_list[0].kwargs["fields"]]
+    assert all("<" not in v for v in values)
+
+
+def _patch_queue(monkeypatch, template: TemplateModel) -> AsyncMock:
+    queue = AsyncMock(return_value=_run(AgentTestRunStatus.QUEUED))
+    _patch_template_load(monkeypatch, template)
+    monkeypatch.setattr(test_handlers, "queue_agent_test_run", queue)
+    monkeypatch.setattr(gate, "AGENT_TESTS_ENABLED", AsyncMock(return_value=True))
+    return queue
+
+
+@pytest.mark.parametrize(
+    "is_active",
+    # A live agent's run publishes its draft on a pass; a paused agent stays
+    # paused, whatever changed, until it is put live.
+    [True, False],
+)
+async def test_only_a_live_agents_run_goes_live_on_a_pass(monkeypatch, is_active):
+    queue = _patch_queue(monkeypatch, _template(is_active=is_active))
+
+    await test_handlers.run_agent_tests_handler(TEMPLATE_ID, _user())
+
+    [queued] = queue.await_args_list
+    assert queued.args[3] is is_active
+
+
+async def test_rewriting_the_scenarios_queues_a_rewrite_run(monkeypatch):
+    queue = _patch_queue(monkeypatch, _template())
+
+    await test_handlers.generate_agent_test_scenarios_handler(TEMPLATE_ID, _user())
+
+    [queued] = queue.await_args_list
+    assert queued.args[4] == AgentTestTrigger.REWRITE
+
+
+async def test_the_overview_shows_the_run_that_judged_this_version(monkeypatch):
+    template = _template()
+    finished = _run(AgentTestRunStatus.PASSED)
+    newer = _run(AgentTestRunStatus.FAILED, id="run-2", fingerprint="f" * 64)
+    _patch_template_load(monkeypatch, template)
+    for name, value in {
+        "get_agent_test_version_runs": AsyncMock(return_value=(None, finished)),
+        "list_agent_test_runs": AsyncMock(return_value=[newer, finished]),
+        "list_agent_test_results": AsyncMock(return_value=[]),
+        "list_agent_test_scenarios": AsyncMock(return_value=[]),
+    }.items():
+        monkeypatch.setattr(test_handlers, name, value)
+    monkeypatch.setattr(gate, "AGENT_TESTS_ENABLED", AsyncMock(return_value=True))
+
+    overview = await test_handlers.get_agent_tests_handler(TEMPLATE_ID, _user())
+
+    assert overview.state == AgentTestState.PASSED
+    assert overview.run is not None and overview.run.id == "run-1"
+    assert [r.id for r in overview.runs] == ["run-2", "run-1"]
+    assert overview.enabled
+
+
+async def test_a_scenario_is_capped_in_runs_turns_and_size(monkeypatch):
+    base = {"name": "s", "persona": "p", "goal": "g", "success": "x"}
+    for mapping in [
+        {**base, "buddy": {"runs": MAX_RUNS + 1}},
+        {**base, "max_turns": MAX_TURNS + 1},
+        {**base, "max_duration_s": MAX_DURATION_S + 1},
+    ]:
+        with pytest.raises(ValueError, match="at most"):
+            from_mapping(mapping)
+
+    _patch_template_load(monkeypatch, _template())
+    monkeypatch.setattr(gate, "AGENT_TESTS_ENABLED", AsyncMock(return_value=True))
+    huge = AgentTestScenarioRequest(
+        name="huge", scenario={**base, "persona": "x" * 40_000}, is_enabled=True
+    )
+    with pytest.raises(HTTPException) as refused:
+        await test_handlers.create_agent_test_scenario_handler(
+            TEMPLATE_ID, huge, _user()
+        )
+    assert refused.value.status_code == 400
+
+
+async def test_an_agent_has_a_bounded_number_of_scenarios(monkeypatch):
+    _patch_template_load(monkeypatch, _template())
+    monkeypatch.setattr(gate, "AGENT_TESTS_ENABLED", AsyncMock(return_value=True))
+    full = [_scenario_row(f"s-{i}") for i in range(test_handlers.MAX_SCENARIOS)]
+    monkeypatch.setattr(
+        test_handlers, "list_agent_test_scenarios", AsyncMock(return_value=full)
+    )
+    create = AsyncMock()
+    monkeypatch.setattr(test_handlers, "create_agent_test_scenario", create)
+    body = AgentTestScenarioRequest(
+        name="one-more",
+        scenario={"persona": "p", "goal": "g", "success": "x"},
+        is_enabled=True,
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await test_handlers.create_agent_test_scenario_handler(
+            TEMPLATE_ID, body, _user()
+        )
+
+    assert refused.value.status_code == 409
+    create.assert_not_awaited()
 
 
 def test_a_blank_outcome_expects_none():
     assert BuddySpec(outcome="").outcomes == []
     assert BuddySpec(outcome=["", "CONFIRM"]).outcomes == ["CONFIRM"]
+
+
+async def test_an_agent_with_a_draft_cannot_move_to_another_owner(monkeypatch):
+    mocks = _patch_template_writes(monkeypatch, _template(is_active=True))
+    monkeypatch.setattr(
+        gate, "get_agent_test_version_runs", AsyncMock(return_value=(None, None))
+    )
+    request = _request(ReplaceTemplateRequest, is_active=True)
+    request.flow = _edited_flow()
+    request.merchant_id = "another-shop"
+
+    with pytest.raises(HTTPException) as refused:
+        await template_handlers.replace_template_handler(TEMPLATE_ID, request, _user())
+
+    assert refused.value.status_code == 409
+    mocks["replace_template"].assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -439,6 +1540,39 @@ async def test_test_calls_run_the_draft_and_real_calls_the_published_version(
     assert loaded == ["head" if draft else "live"]
 
 
+async def test_a_live_agents_draft_is_published_when_it_passes(monkeypatch):
+    draft = _template(is_active=True, current_version=3, published_version=2)
+    db = SuiteDb(monkeypatch, draft, [_scenario_row()], passed=True)
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING, go_live=True))
+
+    db.activate.assert_awaited_once_with(TEMPLATE_ID, 3)
+
+
+async def test_a_live_agent_without_a_draft_has_nothing_to_publish(monkeypatch):
+    db = SuiteDb(monkeypatch, _template(is_active=True), [_scenario_row()], passed=True)
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING, go_live=True))
+    db.activate.assert_not_awaited()
+
+
+async def test_a_live_agents_prompt_edit_is_saved_as_a_draft(monkeypatch):
+    live = _template(is_active=True, current_version=3)
+    mocks = _patch_template_writes(monkeypatch, live)
+    monkeypatch.setattr(
+        gate, "get_agent_test_version_runs", AsyncMock(return_value=(None, None))
+    )
+    request = _request(ReplaceTemplateRequest, is_active=True)
+    request.flow = _edited_flow()
+
+    await template_handlers.replace_template_handler(TEMPLATE_ID, request, _user())
+
+    written = mocks["replace_template"].await_args.kwargs
+    assert written["is_active"] is True
+    assert (written["set_published"], written["published_version"]) == (True, 3)
+    plan = mocks["apply_save"].await_args.args[1]
+    assert plan.queue and plan.go_live
+
+
 def test_the_version_real_calls_run_is_never_pruned():
     query, _ = prune_template_versions_query(TEMPLATE_ID, 20, 10)
     assert "published_version" in query
@@ -464,6 +1598,14 @@ def test_a_restored_draft_keeps_the_secrets_real_calls_use():
     assert "WHEN $12::boolean AND $13::integer IS NOT NULL" in query
     assert "THEN secrets ELSE $6::jsonb END" in query
     assert values[5] == '{"k": "v2"}'
+
+
+def test_the_verdict_of_what_real_calls_run_is_never_pruned():
+    # Saves that change no content still bump the version past retention.
+    query, values = prune_agent_test_history_query(TEMPLATE_ID, 4, "fp-live")
+    assert "live_verdict" in query
+    assert "r.id NOT IN (SELECT id FROM live_verdict)" in query
+    assert values == [TEMPLATE_ID, 4, "fp-live"]
 
 
 def _gemini_greeting_template(is_draft: bool) -> Any:
@@ -659,6 +1801,55 @@ async def test_the_setup_check_names_every_provider_that_cannot_start(monkeypatc
     ]
 
 
+async def test_an_agent_that_cannot_start_a_call_fails_before_any_test_call(
+    monkeypatch,
+):
+    db = SuiteDb(monkeypatch, _template(), [], passed=True)
+    db.setup.return_value = ["LLM: RuntimeError: deployment not found"]
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING, go_live=True))
+
+    assert db.finished == [
+        (
+            AgentTestRunStatus.FAILED,
+            "The agent cannot start a call: LLM: RuntimeError: deployment not found",
+        )
+    ]
+    db.generate.assert_not_awaited()
+    db.run_once.assert_not_awaited()
+    db.activate.assert_not_awaited()
+
+
+async def test_a_test_call_the_harness_broke_is_run_once_more(monkeypatch):
+    db = SuiteDb(monkeypatch, _template(), [_scenario_row()], passed=True)
+    db.run_once.side_effect = [
+        RunResult("lead-1", False, ["judge call failed"]),
+        RunResult("lead-2", True),
+    ]
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING))
+
+    assert db.run_once.await_count == 2
+    assert db.finished == [(AgentTestRunStatus.PASSED, None)]
+
+
+async def test_a_call_the_agent_fails_fails_its_scenario_with_no_retry(
+    monkeypatch,
+):
+    """An agent that gets it wrong one time in two is wrong: no second call."""
+    db = SuiteDb(monkeypatch, _template(), [_scenario_row()], passed=True)
+    db.run_once.side_effect = [
+        RunResult("lead-1", False, ["never read the price"]),
+        RunResult("lead-2", True),
+    ]
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING, go_live=True))
+
+    assert db.run_once.await_count == 1
+    assert db.finished == [(AgentTestRunStatus.FAILED, "1 of 1 scenario runs failed")]
+    db.activate.assert_not_awaited()
+
+
 def test_only_situations_about_the_ending_check_it():
     """An angry caller the agent wins over still confirms: that is not a failure."""
     template = _template()
@@ -694,6 +1885,24 @@ def test_safety_situations_make_two_calls():
     assert from_mapping(wrong_person).runs == 2
     assert checklist.KINDS["off_topic"].runs == 2
     assert checklist.KINDS["busy"].runs == 1
+
+
+async def test_a_custom_scenario_without_lead_data_runs_on_buddys(monkeypatch):
+    generated = _scenario_row("written-by-buddy")
+    generated.scenario["buddy"]["payload"] = {"customer_name": "Priya"}
+    generated.is_enabled = False
+    custom = _scenario_row("custom-one")
+    custom.source = AgentTestScenarioSource.CUSTOM
+    custom.scenario["buddy"].pop("payload", None)
+    db = SuiteDb(monkeypatch, _template(), [generated, custom], passed=True)
+
+    await suite.run_suite(_run(AgentTestRunStatus.RUNNING))
+
+    [call] = db.run_once.await_args_list
+    item = call.args[0]
+    assert item.name == "custom-one"
+    assert item.spec.payload == {"customer_name": "Priya"}
+    assert db.finished == [(AgentTestRunStatus.PASSED, None)]
 
 
 def test_the_template_api_reports_which_version_real_calls_run():

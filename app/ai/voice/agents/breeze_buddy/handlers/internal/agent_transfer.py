@@ -13,6 +13,7 @@ target leaves the current agent fully healthy.
 
 from typing import Any, Dict, List, Optional
 
+from app.ai.voice.agents.breeze_buddy.scenario_tests.gate import testable
 from app.ai.voice.agents.breeze_buddy.template.context import TemplateContext
 from app.ai.voice.agents.breeze_buddy.template.loader import (
     DRAFT_EXECUTION_MODES,
@@ -86,6 +87,12 @@ async def connect_to_agent(
             return {"status": "error", "error": "cannot transfer to an IVR template"}
         if "voice" not in (template.supported_channels or ["voice"]):
             return {"status": "error", "error": "target does not support voice"}
+        # A test call stays on testable agents: an MCP target's tools would be
+        # called for real.
+        if bot.is_eval_mode and not testable(
+            template.flow, template.supported_channels, template.configurations
+        ):
+            return {"status": "error", "error": "target cannot take a test call"}
     except Exception as e:
         logger.error(f"[agent_transfer] target load failed: {e}", exc_info=True)
         return {"status": "error", "error": f"target template unavailable: {e}"}

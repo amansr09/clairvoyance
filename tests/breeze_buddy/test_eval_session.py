@@ -45,7 +45,7 @@ from starlette.websockets import WebSocketState
 # isort: off
 # template.types must load before the transport modules (reversing the
 # order trips a circular import — see test_response_transform.py).
-from app.ai.voice.agents.breeze_buddy.template.types import HttpRequestConfig
+from app.ai.voice.agents.breeze_buddy.template.types import FlowMode, HttpRequestConfig
 
 import app.ai.voice.agents.breeze_buddy.handlers.transport.http_requester as hr
 from app.database.queries.breeze_buddy.analytics.analytics import (
@@ -561,11 +561,29 @@ async def test_a_bad_fixture_is_refused_before_the_lead_is_touched(eval_setup):
     assert eval_setup.touched == []
 
 
+def _untestable(flow, channels, configurations):
+    async def load(lead):
+        template = SimpleNamespace(
+            flow=flow, supported_channels=channels, configurations=configurations
+        )
+        return template, None, {}
+
+    return load
+
+
+_ivr_template = _untestable({"mode": FlowMode.IVR.value}, ["voice"], None)
+# A chat agent's voice is in-widget; an MCP agent's tools would be called for real.
+_chat_template = _untestable({}, ["chat", "voice"], None)
+_mcp_template = _untestable({}, ["voice"], {"mcp": {"servers": [{"name": "shop"}]}})
+
+
 async def _missing_template(lead):
     raise ValueError("no such template")
 
 
-@pytest.mark.parametrize("load", [_missing_template])
+@pytest.mark.parametrize(
+    "load", [_ivr_template, _chat_template, _mcp_template, _missing_template]
+)
 async def test_a_template_it_cannot_run_is_refused_before_the_lead_is_touched(
     eval_setup, monkeypatch, load
 ):

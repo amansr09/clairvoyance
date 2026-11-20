@@ -95,6 +95,7 @@ from app.ai.voice.agents.breeze_buddy.processors import (
 from app.ai.voice.agents.breeze_buddy.processors.voice_ui_stream import (
     coerce_ui_action_text,
 )
+from app.ai.voice.agents.breeze_buddy.scenario_tests.gate import testable
 from app.ai.voice.agents.breeze_buddy.services.inbound_policy import (
     get_block_redirect,
 )
@@ -872,6 +873,15 @@ class Agent:
         except Exception as e:
             logger.error(f"Eval session setup failed: {e}")
             await close_websocket_safely(self.ws, code=4000, reason="Eval setup failed")
+            return False
+        if not testable(
+            self.template.flow,
+            self.template.supported_channels,
+            self.template.configurations,
+        ):
+            await close_websocket_safely(
+                self.ws, code=4000, reason="This agent is not testable"
+            )
             return False
 
         self.lead = await update_lead_call_initiated_time_by_id(

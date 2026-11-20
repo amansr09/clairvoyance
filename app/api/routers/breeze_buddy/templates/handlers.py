@@ -16,11 +16,21 @@ from app.ai.voice.agents.breeze_buddy.dispatch.alerts import (
 from app.ai.voice.agents.breeze_buddy.managers.utils import (
     spawn_realtime_opening_line_regeneration,
 )
+from app.ai.voice.agents.breeze_buddy.scenario_tests.gate import (
+    SavePlan,
+    Verdict,
+    apply_save,
+    decide_save,
+    fingerprint,
+    gated,
+    plan_save,
+)
 from app.ai.voice.agents.breeze_buddy.template.cache import invalidate_template
 from app.ai.voice.agents.breeze_buddy.template.types import (
     CreateTemplateRequest,
     FlowMode,
     ReplaceTemplateRequest,
+    TemplateModel,
 )
 from app.ai.voice.agents.breeze_buddy.utils.common import (
     gemini_realtime_from_configurations,
@@ -35,6 +45,9 @@ from app.api.routers.breeze_buddy.numbers.rbac import require_number_in_tenant_s
 from app.core.concurrency import spawn_background_task
 from app.core.logger import logger
 from app.database.accessor import get_telephony_number_by_id, get_template_in_scope
+from app.database.accessor.breeze_buddy.agent_tests import (
+    set_pending_agent_test_runs_go_live,
+)
 from app.database.accessor.breeze_buddy.evaluation_config import (
     initialize_evaluation_config,
 )
@@ -42,11 +55,13 @@ from app.database.accessor.breeze_buddy.template import (
     check_template_usage,
     create_template,
     delete_template_if_not_referenced,
+    get_live_template_by_id,
     get_template_by_id,
     get_templates_list,
     replace_template,
 )
 from app.schemas import UserInfo
+from app.schemas.breeze_buddy.agent_tests import AgentTestTrigger
 from app.schemas.breeze_buddy.template import (
     DeleteTemplateResponse,
     TemplateListResponse,
@@ -95,6 +110,21 @@ async def refuse_bad_provider_accounts(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"provider_credentials": found},
         )
+
+
+async def queue_agent_tests(
+    template: TemplateModel,
+    plan: SavePlan,
+    trigger: AgentTestTrigger,
+    requested_by: str,
+) -> None:
+    """Apply a saved template's test plan; the agent-tests worker runs what it
+    queues. The save has committed, so a failure here is logged, not raised:
+    the agent stays as saved and its tests can be run from the Tests tab."""
+    try:
+        await apply_save(template, plan, trigger, requested_by)
+    except Exception as e:
+        logger.error(f"Failed to queue tests for template {template.id}: {e}")
 
 
 async def create_template_handler(
@@ -204,6 +234,13 @@ async def create_template_handler(
                 context={"reveal_secrets": True},
             )
 
+        # A testable agent starts as a draft and goes live once its tests pass.
+        plan = (
+            decide_save(template_data.is_active, False, Verdict())
+            if await gated(flow, list(template_data.supported_channels), configurations)
+            else None
+        )
+
         template = await create_template(
             template_id=str(uuid4()),
             reseller_id=template_data.reseller_id,
@@ -215,7 +252,7 @@ async def create_template_handler(
             configurations=configurations,
             secrets=template_data.secrets,
             telephony_number_id=template_data.telephony_number_id,
-            is_active=template_data.is_active,
+            is_active=plan.is_active if plan else template_data.is_active,
             supported_channels=list(template_data.supported_channels),
             now=now,
             changed_by=current_user.username,
@@ -244,6 +281,11 @@ async def create_template_handler(
         # Pre-generate the Gemini Live opening line in the background (no-op
         # for templates without one) so the first call finds it cached.
         spawn_realtime_opening_line_regeneration(template)
+
+        if plan:
+            await queue_agent_tests(
+                template, plan, AgentTestTrigger.CREATED, current_user.username
+            )
 
         return {
             "status": "success",
@@ -581,6 +623,44 @@ async def replace_template_handler(
             )
         ]
 
+        # Content goes live only once its tests pass: until then it is a
+        # draft and real calls keep the published version. See
+        # scenario_tests/gate.py.
+        plan = None
+        if await gated(flow, supported_channels, configurations):
+            plan = await plan_save(
+                existing_template,
+                fingerprint(
+                    flow,
+                    configurations,
+                    template_data.expected_payload_schema,
+                    template_data.expected_callback_response_schema,
+                ),
+                template_data.is_active,
+            )
+            if plan.refused:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT, detail=plan.refused
+                )
+            # Real calls would run a published version left with the old
+            # owner, whose history a new owner cannot read.
+            if plan.published_version is not None and (
+                reseller_id != existing_template.reseller_id
+                or template_data.merchant_id != existing_template.merchant_id
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="This agent has a draft waiting for its tests. Publish "
+                    "or discard it before moving the agent to another owner.",
+                )
+
+        is_active = plan.is_active if plan else template_data.is_active
+        # A pause sticks, whether or not tests apply now: a run that passes
+        # later must not turn the agent back on. Before the save, so a failure
+        # here refuses it.
+        if not is_active:
+            await set_pending_agent_test_runs_go_live(template_id, None, False)
+
         updated_template = await replace_template(
             template_id=template_id,
             reseller_id=reseller_id,
@@ -591,11 +671,13 @@ async def replace_template_handler(
             configurations=configurations,
             secrets=merged_secrets,
             telephony_number_id=template_data.telephony_number_id,
-            is_active=template_data.is_active,
+            is_active=is_active,
             merchant_id=template_data.merchant_id,
             supported_channels=supported_channels,
             now=now,
             changed_by=current_user.username,
+            set_published=True,
+            published_version=plan.published_version if plan else None,
         )
 
         if not updated_template:
@@ -632,7 +714,16 @@ async def replace_template_handler(
         # the updated template no longer qualifies (greeting removed /
         # non-Gemini / disabled), this is a no-op and the invalidated key
         # stays deleted.
-        spawn_realtime_opening_line_regeneration(updated_template)
+        spawn_realtime_opening_line_regeneration(
+            await get_live_template_by_id(template_id)
+            if updated_template.is_draft
+            else updated_template
+        )
+
+        if plan:
+            await queue_agent_tests(
+                updated_template, plan, AgentTestTrigger.EDITED, current_user.username
+            )
 
         spawn_background_task(
             emit_template_updated_alert(

@@ -11,20 +11,30 @@ from app.ai.voice.agents.breeze_buddy.dispatch.alerts import (
 from app.ai.voice.agents.breeze_buddy.managers.utils import (
     spawn_realtime_opening_line_regeneration,
 )
+from app.ai.voice.agents.breeze_buddy.scenario_tests.gate import (
+    gated,
+    plan_save,
+    template_fingerprint,
+)
 from app.ai.voice.agents.breeze_buddy.template.cache import invalidate_template
 from app.ai.voice.agents.breeze_buddy.utils.secrets import mask_template_secrets
 from app.api.routers.breeze_buddy.templates.handlers import (
+    queue_agent_tests,
     refuse_bad_provider_accounts,
 )
 from app.core.concurrency import spawn_background_task
 from app.core.logger import logger
-from app.database.accessor.breeze_buddy.template import get_template_by_id
+from app.database.accessor.breeze_buddy.template import (
+    get_live_template_by_id,
+    get_template_by_id,
+)
 from app.database.accessor.breeze_buddy.template_version import (
     get_template_version,
     list_template_versions,
     rollback_template_to_version,
 )
 from app.schemas import UserInfo
+from app.schemas.breeze_buddy.agent_tests import AgentTestTrigger
 from app.schemas.breeze_buddy.template_version import (
     RollbackTemplateRequest,
     TemplateVersionDetailResponse,
@@ -101,6 +111,9 @@ async def rollback_template_handler(
     found = await get_template_version(
         template_id, body.version, template.reseller_id, template.merchant_id
     )
+    # Restored content is tested like an edit: on a live agent it is a draft,
+    # and real calls keep the published version, until it passes.
+    plan = None
     if found is not None:
         snapshot, _ = found
         await refuse_bad_provider_accounts(
@@ -108,6 +121,12 @@ async def rollback_template_handler(
             template.reseller_id,
             template.merchant_id,
         )
+        if await gated(
+            snapshot.flow, snapshot.supported_channels, snapshot.configurations
+        ):
+            plan = await plan_save(
+                template, template_fingerprint(snapshot), template.is_active
+            )
     try:
         new_head = await rollback_template_to_version(
             template_id,
@@ -115,6 +134,8 @@ async def rollback_template_handler(
             template.reseller_id,
             template.merchant_id,
             changed_by=current_user.username,
+            set_published=True,
+            published_version=plan.published_version if plan else None,
         )
     except (asyncpg.UniqueViolationError, asyncpg.ForeignKeyViolationError) as e:
         # loguru has no exc_info kwarg -- logger.opt(exception=...) is what
@@ -151,7 +172,13 @@ async def rollback_template_handler(
     # without this a rolled-back Gemini Live template serves inbound/web
     # calls no opening line until its next save. Unmasked head: generation
     # needs the real config. No-op when the restored template doesn't qualify.
-    spawn_realtime_opening_line_regeneration(new_head)
+    spawn_realtime_opening_line_regeneration(
+        await get_live_template_by_id(template_id) if new_head.is_draft else new_head
+    )
+    if plan:
+        await queue_agent_tests(
+            new_head, plan, AgentTestTrigger.ROLLBACK, current_user.username
+        )
 
     # The audit notice every head change owes the channel — a rollback is a
     # new version, and skipping it would show v3 -> v4, then v5 -> v6, with

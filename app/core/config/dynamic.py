@@ -923,6 +923,35 @@ async def AGENT_TESTS_ENABLED() -> bool:
     return await get_config("AGENT_TESTS_ENABLED", False, bool)
 
 
+async def AGENT_TESTS_CONCURRENCY() -> int:
+    """Test calls one suite runs at once on the agent-tests worker pod. Each
+    is a full agent session on that pod plus judge and caller calls to
+    Bedrock; lower it when Bedrock answers 429."""
+    return await get_config("AGENT_TESTS_CONCURRENCY", 5, int)
+
+
+async def AGENT_TESTS_STALE_RUN_MINUTES() -> int:
+    """A run RUNNING longer than this lost its worker (killed pod) and is
+    closed as ERROR. Keep it above the longest suite."""
+    return await get_config("AGENT_TESTS_STALE_RUN_MINUTES", 20, int)
+
+
+async def AGENT_TESTS_POLL_INTERVAL_SECONDS() -> int:
+    """How often the agent-tests worker looks for queued runs.
+
+    Hardened against malformed env overrides (get_env_value returns the RAW
+    string when int() conversion fails): a bad value would stop the worker.
+    """
+    value = await get_config("AGENT_TESTS_POLL_INTERVAL_SECONDS", 5, int)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            f"Invalid AGENT_TESTS_POLL_INTERVAL_SECONDS value {value!r}; using 5"
+        )
+        return 5
+
+
 # --- Knowledge Base (RAG) ---
 async def KB_AZURE_OPENAI_ENDPOINT() -> str:
     """Azure endpoint for the ``azure_openai`` EMBEDDING provider (the

@@ -512,6 +512,38 @@ async def emit_template_updated_alert(
         )
 
 
+async def emit_agent_tests_alert(
+    title: str,
+    template_id: str,
+    template_name: str,
+    version: int,
+    merchant_id: Optional[str],
+    result: str,
+    real_calls: str,
+    by: Optional[str],
+) -> None:
+    """Best-effort Slack notice that an agent's tests failed, or that an admin
+    passed them by hand. Not throttled, like ``emit_template_updated_alert``:
+    each is a change someone needs to see."""
+    fields = [
+        {
+            "name": "Template",
+            "value": f"{_slack_text(template_name)} ({_slack_text(template_id)})",
+        },
+        {"name": "Version", "value": f"v{version}"},
+        {"name": "Result", "value": _slack_text(result)},
+        {"name": "Real calls", "value": _slack_text(real_calls)},
+        {"name": "Merchant", "value": _slack_text(merchant_id or "-")},
+        {"name": "By", "value": _slack_text(by or "-")},
+    ]
+    try:
+        await slack_alert.send(title=title, fields=fields, include_tags=False)
+    except Exception as slack_exc:  # noqa: BLE001
+        logger.warning(
+            f"[AGENT_TESTS] Slack alert failed for {template_id}: {slack_exc}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Helper used by the health monitor to mark a condition as "cleared". Lets us
 # fire a fresh alert immediately when the same condition returns rather than

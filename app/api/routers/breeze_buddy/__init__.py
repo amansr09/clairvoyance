@@ -70,6 +70,9 @@ from app.api.routers.breeze_buddy.template_generator import (
     router as template_generator_router,
 )
 from app.api.routers.breeze_buddy.templates import router as templates_router
+from app.api.routers.breeze_buddy.templates.agent_tests import (
+    router as agent_tests_router,
+)
 from app.api.routers.breeze_buddy.templates.version import (
     router as template_versions_router,
 )
@@ -128,6 +131,8 @@ router.include_router(numbers_router, prefix="", tags=["numbers"])
 router.include_router(templates_router, prefix="", tags=["templates"])
 # Template version history + rollback (lineage).
 router.include_router(template_versions_router, prefix="", tags=["templates"])
+# Agent tests: scenarios, runs and the go-live verdict.
+router.include_router(agent_tests_router, prefix="", tags=["templates"])
 router.include_router(topics_router, prefix="", tags=["topics"])
 router.include_router(evaluations_router, prefix="", tags=["evaluations"])
 

@@ -503,7 +503,7 @@ def _flag(env_var: str, default_main_server: bool, default_agent_pool: bool) -> 
 
 ENABLE_DISPATCHER = _flag("ENABLE_DISPATCHER", True, False)
 ENABLE_EVALUATIONS_WORKER = _flag("ENABLE_EVALUATIONS_WORKER", False, False)
-# Agent-tests pod only: it serves the eval route's test calls.
+# Agent-tests worker pod only (scenario_tests/worker.py).
 ENABLE_AGENT_TESTS_WORKER = _flag("ENABLE_AGENT_TESTS_WORKER", False, False)
 
 # Promoter
@@ -895,6 +895,12 @@ AGENT_TESTS_WRITER_MODEL = os.environ.get(
 )
 AGENT_TESTS_WRITER_MAX_TOKENS = int(
     os.environ.get("AGENT_TESTS_WRITER_MAX_TOKENS", "8192")
+)
+# Test history kept per agent: runs (with their results and test-call leads)
+# of the newest versions, and of the published one; older ones are pruned
+# after each run, like TEMPLATE_VERSION_RETENTION.
+AGENT_TESTS_VERSION_RETENTION = max(
+    1, int(os.getenv("AGENT_TESTS_VERSION_RETENTION", "4"))
 )
 
 # LangFuse Configuration (for OpenTelemetry tracing only)

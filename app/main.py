@@ -23,6 +23,10 @@ from app.ai.voice.agents.breeze_buddy.dispatch import (
 from app.ai.voice.agents.breeze_buddy.managers.calls import (
     reconcile_stuck_processing_leads,
 )
+from app.ai.voice.agents.breeze_buddy.scenario_tests.worker import (
+    start_agent_tests_worker,
+    stop_agent_tests_worker,
+)
 from app.ai.voice.agents.breeze_buddy.services.agent_router.client import (
     close_smart_router_client,
 )
@@ -59,6 +63,7 @@ from app.core.config.static import (
     CHAT_SESSION_END_TIMEOUT_LOOP_INTERVAL_SECONDS,
     CORS_ALLOWED_ORIGINS,
     CRM_ROLE,
+    ENABLE_AGENT_TESTS_WORKER,
     ENABLE_DISPATCHER,
     ENABLE_DRAGONTTS_KILL_SWITCH,
     ENABLE_EVALUATIONS_WORKER,
@@ -163,7 +168,12 @@ async def lifespan(_app: FastAPI):
 
     # Start background task scheduler if enabled
     global _background_scheduler
-    if CRM_ROLE == "api" and await ENABLE_BACKGROUND_TASKS():
+    # The agent-tests pod is a worker pod too: it runs only its own loop.
+    if (
+        CRM_ROLE == "api"
+        and not ENABLE_AGENT_TESTS_WORKER
+        and await ENABLE_BACKGROUND_TASKS()
+    ):
         try:
             # Create scheduler instance with configurable loop interval
             _background_scheduler = BackgroundTaskScheduler(
@@ -262,6 +272,11 @@ async def lifespan(_app: FastAPI):
             f"CRM_ROLE={CRM_ROLE}: background task scheduler not started "
             "(a worker pod runs exactly one loop)"
         )
+    elif ENABLE_AGENT_TESTS_WORKER:
+        logger.info(
+            "Agent tests worker pod: background task scheduler not started "
+            "(a worker pod runs exactly one loop)"
+        )
     else:
         logger.info(
             "Background task scheduler disabled (ENABLE_BACKGROUND_TASKS=false)"
@@ -272,7 +287,7 @@ async def lifespan(_app: FastAPI):
     # reconciler — no separate boot-time initialisation logic. See §2.
     # Gated on CRM_ROLE like the scheduler above: a pod is its role, so a
     # CRM worker pod runs exactly one loop and never also dials voice.
-    if CRM_ROLE == "api" and ENABLE_DISPATCHER:
+    if CRM_ROLE == "api" and ENABLE_DISPATCHER and not ENABLE_AGENT_TESTS_WORKER:
         try:
             # Fast cold-start: trigger one reconcile_channel_tokens immediately
             # so workers don't BLPOP on empty channel LISTs while waiting for
@@ -311,14 +326,27 @@ async def lifespan(_app: FastAPI):
             f"CRM_ROLE={CRM_ROLE}: event-driven dispatcher not started "
             "(a worker pod runs exactly one loop)"
         )
+    elif ENABLE_AGENT_TESTS_WORKER:
+        logger.info(
+            "Agent tests worker pod: event-driven dispatcher not started "
+            "(a worker pod runs exactly one loop)"
+        )
     else:
         logger.info("Event-driven dispatcher disabled (ENABLE_DISPATCHER=false)")
 
-    if ENABLE_EVALUATIONS_WORKER:
+    if ENABLE_EVALUATIONS_WORKER and not ENABLE_AGENT_TESTS_WORKER:
         try:
             await start_analysis_worker()
         except Exception as e:
             logger.error(f"Failed to start conversation analysis worker: {e}")
+
+    # Agent tests run only on the agent-tests deployment: see
+    # ENABLE_AGENT_TESTS_WORKER.
+    if ENABLE_AGENT_TESTS_WORKER:
+        try:
+            await start_agent_tests_worker()
+        except Exception as e:
+            logger.error(f"Failed to start agent tests worker: {e}")
 
     # CRM worker roles (design/worker-runtime.md): one image, N pods. A
     # non-"api" CRM_ROLE runs its drain loop as an asyncio task in this
@@ -347,7 +375,7 @@ async def lifespan(_app: FastAPI):
     # Stop the event-driven dispatcher before scheduler/db close so any
     # in-flight workers get their locks/tokens released cleanly. Mirrors
     # the startup gate — only an api pod ever started these.
-    if CRM_ROLE == "api" and ENABLE_DISPATCHER:
+    if CRM_ROLE == "api" and ENABLE_DISPATCHER and not ENABLE_AGENT_TESTS_WORKER:
         try:
             logger.info("Stopping event-driven dispatcher...")
             await stop_workers()
@@ -359,6 +387,11 @@ async def lifespan(_app: FastAPI):
         await stop_analysis_worker()
     except Exception as e:
         logger.error(f"Error stopping conversation analysis worker: {e}")
+
+    try:
+        await stop_agent_tests_worker()
+    except Exception as e:
+        logger.error(f"Error stopping agent tests worker: {e}")
 
     # Stop background task scheduler if running
     if _background_scheduler:
@@ -495,6 +528,10 @@ async def drain():
     global _is_draining
     logger.info("Drain endpoint called by Kubernetes - marking pod as draining")
     _is_draining = True
+    # Before SIGTERM, while the pod still takes connections: the test run it
+    # cuts off goes back to the queue instead of failing its remaining calls.
+    if ENABLE_AGENT_TESTS_WORKER:
+        await stop_agent_tests_worker()
     return JSONResponse({"status": "draining"})
 
 
