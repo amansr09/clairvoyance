@@ -51,6 +51,7 @@ class ExecutionMode(str, Enum):
     DAILY_TEST = "DAILY_TEST"  # Test Daily (web) calls
     DAILY_STREAM = "DAILY_STREAM"  # Daily STT/TTS-only (no LLM, client-driven)
     HOLD_TRANSFER = "HOLD_TRANSFER"  # Outbound leg of a hold & consultative transfer
+    EVAL = "EVAL"  # Scenario eval session driven by the eval harness
 
 
 class CallDirection(str, Enum):

@@ -13,7 +13,11 @@ from app.ai.voice.agents.breeze_buddy.processors.transcript_collector import (
 from app.ai.voice.agents.breeze_buddy.processors.transcription_gate import (
     TranscriptionGateProcessor,
 )
+from app.ai.voice.agents.breeze_buddy.processors.unspoken_reply import (
+    UnspokenReplyProcessor,
+)
 from app.ai.voice.agents.breeze_buddy.processors.user_idle import (
+    SentTextObserver,
     UserIdleCallbackHandler,
 )
 from app.ai.voice.agents.breeze_buddy.processors.voice_ui_stream import (
@@ -23,9 +27,11 @@ from app.ai.voice.agents.breeze_buddy.processors.voice_ui_stream import (
 __all__ = [
     "KnowledgeRetrievalProcessor",
     "MetricsCollectorProcessor",
+    "SentTextObserver",
     "TimelineObserver",
     "TranscriptCollectorProcessor",
     "TranscriptionGateProcessor",
+    "UnspokenReplyProcessor",
     "UserIdleCallbackHandler",
     "VoiceUiStreamProcessor",
 ]

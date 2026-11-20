@@ -792,20 +792,22 @@ async def reconcile_stuck_processing_leads():
 
             # Page on it: a lead this old is either a lost call-end webhook or
             # a real call still running, and closing a live one loses its
-            # outcome (call.completed dedupes on call_id).
-            await raise_long_running_call(
-                lead_id=str(locked_lead.id),
-                call_id=locked_lead.call_id,
-                template=locked_lead.template,
-                merchant_id=locked_lead.merchant_id,
-                direction=getattr(locked_lead.call_direction, "value", None),
-                call_initiated_time=(
-                    locked_lead.call_initiated_time.isoformat()
-                    if locked_lead.call_initiated_time
-                    else None
-                ),
-                stale_minutes=BB_STUCK_CALL_STALE_MINUTES,
-            )
+            # outcome (call.completed dedupes on call_id). An eval session is
+            # neither: no caller, no carrier, and the runner reports it.
+            if locked_lead.execution_mode != ExecutionMode.EVAL:
+                await raise_long_running_call(
+                    lead_id=str(locked_lead.id),
+                    call_id=locked_lead.call_id,
+                    template=locked_lead.template,
+                    merchant_id=locked_lead.merchant_id,
+                    direction=getattr(locked_lead.call_direction, "value", None),
+                    call_initiated_time=(
+                        locked_lead.call_initiated_time.isoformat()
+                        if locked_lead.call_initiated_time
+                        else None
+                    ),
+                    stale_minutes=BB_STUCK_CALL_STALE_MINUTES,
+                )
 
             # Merge, don't obliterate: the update REPLACES meta_data and
             # overwrites outcome, so a bare write here destroys whatever a
@@ -898,7 +900,13 @@ async def handle_call_completion(
     )
 
     config = await _get_lead_config(lead)
-    if not config and lead.template not in TEMPLATELESS_PLACEHOLDER_TEMPLATES:
+    if (
+        not config
+        and lead.template not in TEMPLATELESS_PLACEHOLDER_TEMPLATES
+        # An eval run dials no one, so a new agent has no dispatch config yet;
+        # its result must still be recorded.
+        and lead.execution_mode != ExecutionMode.EVAL
+    ):
         return
 
     # Override outcome to "TRANSFERRED" for transfer calls

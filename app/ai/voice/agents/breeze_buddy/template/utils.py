@@ -9,6 +9,7 @@ from app.ai.voice.agents.breeze_buddy.template.types import (
     TemplateModel,
 )
 from app.core.logger import logger
+from app.schemas.breeze_buddy.core import ExecutionMode
 from app.services.slack.alert import slack_alert
 
 
@@ -130,6 +131,11 @@ async def send_alert(
     fallback_text = args.get("fallback_text")
     if fallback_text is not None:
         fallback_text = str(fallback_text)
+
+    lead = context.lead
+    if lead is not None and lead.execution_mode == ExecutionMode.EVAL:
+        logger.info(f"[EVAL] alert recorded, not sent: {title}")
+        return {"status": "success"}
 
     try:
         await slack_alert.send(

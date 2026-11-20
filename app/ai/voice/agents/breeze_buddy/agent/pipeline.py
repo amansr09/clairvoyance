@@ -1,7 +1,7 @@
 """Pipeline creation and service initialization for voice agents."""
 
 from datetime import datetime
-from typing import Any, Callable, Literal, Optional
+from typing import Any, AsyncGenerator, AsyncIterator, Callable, Literal, Optional
 from zoneinfo import ZoneInfo
 
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
@@ -10,6 +10,7 @@ from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import (
 )
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.frames.frames import Frame
 from pipecat.observers.loggers.llm_log_observer import LLMLogObserver
 from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 from pipecat.observers.loggers.transcription_log_observer import (
@@ -27,6 +28,8 @@ from pipecat.processors.frameworks.rtvi import (
     RTVIFunctionCallReportLevel,
     RTVIObserverParams,
 )
+from pipecat.services.stt_service import STTService
+from pipecat.services.tts_service import TTSService
 from pipecat.turns.user_mute import AlwaysUserMuteStrategy, BaseUserMuteStrategy
 from pipecat.turns.user_start import (
     BaseUserTurnStartStrategy,
@@ -50,6 +53,7 @@ from app.ai.voice.agents.breeze_buddy.processors import (
     KnowledgeRetrievalProcessor,
     TranscriptCollectorProcessor,
     TranscriptionGateProcessor,
+    UnspokenReplyProcessor,
     UserIdleCallbackHandler,
 )
 from app.ai.voice.agents.breeze_buddy.processors.metrics_collector_processor import (
@@ -120,10 +124,40 @@ def generate_conversation_id(payload: Optional[dict]) -> str:
     return f"{customer_name}-{shop_name}-{timestamp}"
 
 
+class TextOnlySTTService(STTService):
+    """An eval session's STT: the simulated caller types, so there is no audio
+    to transcribe and no vendor session to open."""
+
+    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
+        yield None
+
+
+class TextOnlyTTSService(TTSService):
+    """An eval session's TTS. Replies arrive as text (skip_tts) and pass
+    through; fixed speech (tts_say, fillers, a pre-TTS message) becomes 20 ms
+    of silence, so its text still reaches the transcript and the bot still
+    starts and stops speaking as on a call. No vendor session is opened."""
+
+    def __init__(self, **kwargs: Any):
+        super().__init__(push_start_frame=True, push_stop_frames=True, **kwargs)
+
+    async def run_tts(
+        self, text: str, context_id: str
+    ) -> AsyncGenerator[Frame | None, None]:
+        async def silence() -> AsyncIterator[bytes]:
+            yield bytes(2 * self.sample_rate // 50)  # 16-bit mono
+
+        async for frame in self._stream_audio_frames_from_iterator(
+            silence(), context_id=context_id
+        ):
+            yield frame
+
+
 async def create_services(
     configurations: Optional[ConfigurationModel],
     include_llm: bool = True,
     accounts: Optional[Accounts] = None,
+    text_only: bool = False,
 ) -> tuple[Optional[Any], Optional[Any], Optional[Any]]:
     """Create STT, LLM, and TTS services.
 
@@ -132,6 +166,9 @@ async def create_services(
         include_llm: When False, skip LLM creation (stream mode). LLM will be None.
         accounts: the call's account resolver (accounts.Accounts, the call's
             tenant): every factory reads it. None = environment accounts only.
+        text_only: An eval session: the text-only STT and TTS stand-ins
+            instead of the template's providers, so a test call opens no
+            vendor STT/TTS session.
 
     Returns:
         Tuple of (stt_service, llm_service_or_None, tts_service). For realtime
@@ -153,6 +190,14 @@ async def create_services(
             "realtime LLM handles audio natively"
         )
         return None, realtime_llm, None
+
+    if text_only:
+        llm = (
+            await get_llm_service(llm_config, accounts=accounts)
+            if include_llm
+            else None
+        )
+        return TextOnlySTTService(), llm, TextOnlyTTSService()
 
     stt_configuration = getattr(configurations, "stt_configuration", None)
 
@@ -237,6 +282,7 @@ async def build_pipeline(
     on_user_idle_timeout: Optional[Callable[[int], Any]] = None,
     mode: Literal["agent", "stream"] = "agent",
     kb_processor: Optional[KnowledgeRetrievalProcessor] = None,
+    is_eval_mode: bool = False,
 ) -> tuple[
     Pipeline,
     LLMContext,
@@ -278,6 +324,9 @@ async def build_pipeline(
         kb_processor: KnowledgeRetrievalProcessor for per-turn KB retrieval
             (auto_retrieve mode). Agent mode only — inserted between the user
             aggregator and the LLM; ignored in stream/realtime modes
+        is_eval_mode: When True, an UnspokenReplyProcessor after the output
+            transport marks the bot's turn for replies a text-mode eval
+            session never speaks. Agent mode only
 
     Returns:
         7-tuple of (pipeline, context, context_aggregator, user_idle_callback_handler, transcription_gate, transcript_collector, metrics_collector)
@@ -562,6 +611,7 @@ async def build_pipeline(
 
     # Pipeline order:
     #   agent mode:  input → stt → gate → user_aggregator → llm → tts → output → assistant_aggregator
+    #                (an eval session adds unspoken_reply before assistant_aggregator)
     #   stream mode: input → stt → gate → transcript_collector → user_aggregator → tts → output
     #
     # Collector sits BEFORE user_aggregator because the aggregator swallows
@@ -588,15 +638,10 @@ async def build_pipeline(
         # retrieval finishes (or fails open) before this turn's inference.
         if kb_processor is not None:
             pipeline_parts.append(kb_processor)
-        pipeline_parts.extend(
-            [
-                llm,
-                tts,
-                metrics_collector,
-                transport.output(),
-                context_aggregator.assistant(),
-            ]
-        )
+        pipeline_parts.extend([llm, tts, metrics_collector, transport.output()])
+        if is_eval_mode:
+            pipeline_parts.append(UnspokenReplyProcessor())
+        pipeline_parts.append(context_aggregator.assistant())
 
     return (
         Pipeline(pipeline_parts),
@@ -614,6 +659,7 @@ async def create_pipeline_task(
     conversation_id: str,
     is_daily_mode: bool = False,
     metrics_collector: Optional[MetricsCollectorProcessor] = None,
+    is_eval_mode: bool = False,
 ) -> PipelineTask:
     """Create and configure the pipeline task.
 
@@ -622,6 +668,8 @@ async def create_pipeline_task(
         conversation_id: Unique conversation identifier
         is_daily_mode: When True, configures RTVIObserver params for real-time event emission
         metrics_collector: The call's collector, so the timeline observer can report into it
+        is_eval_mode: When True, enables RTVI with default observer params: the
+            eval harness is an RTVI client and configures what it observes
 
     Returns:
         Configured PipelineTask
@@ -659,7 +707,7 @@ async def create_pipeline_task(
             enable_usage_metrics=True,
         ),
         "observers": get_observers(metrics_collector),
-        "enable_rtvi": emit_daily_events,
+        "enable_rtvi": emit_daily_events or is_eval_mode,
         "rtvi_observer_params": rtvi_params,
     }
 

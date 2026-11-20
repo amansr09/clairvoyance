@@ -7,6 +7,7 @@ from pipecat.frames.frames import EndFrame
 from app.ai.voice.agents.breeze_buddy.callbacks import (
     service_callback,
 )
+from app.ai.voice.agents.breeze_buddy.handlers.transport.eval_http import EvalHttp
 from app.ai.voice.agents.breeze_buddy.observability.tracing_setup import (
     update_span_with_evaluation_data,
 )
@@ -25,6 +26,7 @@ from app.database.accessor.breeze_buddy.chat_session import (
     flip_chat_session_to_chat,
 )
 from app.schemas.breeze_buddy.conversation_analysis import ConversationChannel
+from app.schemas.breeze_buddy.core import ExecutionMode
 
 callback_map = {
     "service_callback": service_callback,
@@ -234,6 +236,18 @@ async def _finalize_call(context: TemplateContext, args):
         # Store errors collected during the call
         context.lead.metaData["errors"] = context.bot.errors
 
+        # The template version the call ran on, so outcomes trace to a change.
+        template = getattr(context.bot, "template", None)
+        if template is not None:
+            context.lead.metaData["template_version"] = template.current_version
+        eval_http = getattr(context.bot, "aiohttp_session", None)
+        is_eval = isinstance(eval_http, EvalHttp)
+        if is_eval:
+            # An eval saves every request its fixtures answered with the lead,
+            # the end-of-call webhook included, so its callbacks run first.
+            await _run_end_conversation_callbacks(context, args)
+            context.lead.metaData.setdefault("eval", {})["http_calls"] = eval_http.calls
+
         # Store Pipecat metrics collected during the call (best-effort —
         # a failure here must NOT abort the DB update / callbacks below).
         # Seeded with completed generations' metrics (agent-to-agent transfer
@@ -289,7 +303,11 @@ async def _finalize_call(context: TemplateContext, args):
         else:
             logger.warning("No call_sid or lead found, skipping database update")
 
-        if updated_lead and updated_lead.template_id:
+        if (
+            updated_lead
+            and updated_lead.template_id
+            and getattr(updated_lead, "execution_mode", None) != ExecutionMode.EVAL
+        ):
             await enqueue_conversation_evaluation(
                 str(updated_lead.id),
                 ConversationChannel.VOICE,
@@ -300,35 +318,8 @@ async def _finalize_call(context: TemplateContext, args):
         # so context.lead.outcome reflects the final persisted value.
         update_span_with_evaluation_data(context)
 
-        # Execute end_conversation_callbacks
-        if context.end_conversation_callbacks:
-            logger.info(
-                f"Executing {len(context.end_conversation_callbacks)} end_conversation callbacks for call {context.call_sid}"
-            )
-            for callback_name in context.end_conversation_callbacks:
-                try:
-                    callback_handler = callback_map.get(callback_name)
-                    if callback_handler:
-                        logger.info(
-                            f"Calling callback '{callback_name}' for call {context.call_sid}"
-                        )
-                        await callback_handler(context, args)
-                        logger.info(
-                            f"Successfully executed callback '{callback_name}' for call {context.call_sid}"
-                        )
-                    else:
-                        logger.warning(
-                            f"Callback handler '{callback_name}' not found in callback_map for call {context.call_sid}"
-                        )
-                except Exception as callback_error:
-                    logger.error(
-                        f"Error executing callback '{callback_name}' for call {context.call_sid}: {callback_error}",
-                        exc_info=True,
-                    )
-        else:
-            logger.debug(
-                f"No end_conversation_callbacks configured for call {context.call_sid}"
-            )
+        if not is_eval:
+            await _run_end_conversation_callbacks(context, args)
 
     except Exception as e:
         logger.error(
@@ -364,3 +355,35 @@ async def _finalize_call(context: TemplateContext, args):
         clear_log_context()
 
     return {}
+
+
+async def _run_end_conversation_callbacks(context: TemplateContext, args) -> None:
+    """Run the template's end_conversation_callbacks; one failing never stops the rest."""
+    if not context.end_conversation_callbacks:
+        logger.debug(
+            f"No end_conversation_callbacks configured for call {context.call_sid}"
+        )
+        return
+    logger.info(
+        f"Executing {len(context.end_conversation_callbacks)} end_conversation callbacks for call {context.call_sid}"
+    )
+    for callback_name in context.end_conversation_callbacks:
+        try:
+            callback_handler = callback_map.get(callback_name)
+            if callback_handler:
+                logger.info(
+                    f"Calling callback '{callback_name}' for call {context.call_sid}"
+                )
+                await callback_handler(context, args)
+                logger.info(
+                    f"Successfully executed callback '{callback_name}' for call {context.call_sid}"
+                )
+            else:
+                logger.warning(
+                    f"Callback handler '{callback_name}' not found in callback_map for call {context.call_sid}"
+                )
+        except Exception as callback_error:
+            logger.error(
+                f"Error executing callback '{callback_name}' for call {context.call_sid}: {callback_error}",
+                exc_info=True,
+            )

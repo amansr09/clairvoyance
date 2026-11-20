@@ -74,6 +74,8 @@ _NON_CUSTOMER_EXECUTION_MODES = {
     # Transport-only service mode: the client drives the pipeline and owns
     # the payload, so customer_mobile_number is not a trusted identity.
     "DAILY_STREAM",
+    # Scenario eval sessions: a simulated caller, never a customer.
+    "EVAL",
     # HOLD_TRANSFER is deliberately NOT here: the mechanism dials "a third
     # party", but live configs dial real customers (e.g. the ride booker),
     # and losing real identities outweighs the risk of minting a row for a

@@ -59,6 +59,14 @@ class PushLeadRequest(BaseModel):
     execution_mode: Optional[ExecutionMode] = (
         None  # Defaults to TELEPHONY if not provided
     )
+
+    @field_validator("execution_mode")
+    @classmethod
+    def reject_eval_mode(cls, v: Optional[ExecutionMode]) -> Optional[ExecutionMode]:
+        if v == ExecutionMode.EVAL:
+            raise ValueError("EVAL leads are created by the eval runner only")
+        return v
+
     # Playground mode: when true, uses configurations_override
     is_playground: Optional[bool] = False
     configurations_override: Optional[Dict[str, Any]] = (

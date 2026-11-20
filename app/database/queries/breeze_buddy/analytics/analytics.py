@@ -114,6 +114,10 @@ def build_analytics_where_clause(
     # the dashboard alongside regular TELEPHONY calls.
     if filter_execution_mode:
         conditions.append("lct.execution_mode IN ('TELEPHONY', 'HOLD_TRANSFER')")
+    else:
+        # The call lists show test calls too, but never eval sessions: those are
+        # scenario runs on the template's merchant, not conversations with anyone.
+        conditions.append("lct.execution_mode <> 'EVAL'")
 
     # Date range filters - convert IST to UTC before passing to DB
     if "date_from" in filters and filters["date_from"]:

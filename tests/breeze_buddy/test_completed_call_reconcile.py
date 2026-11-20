@@ -345,6 +345,60 @@ async def test_reaper_still_falls_back_to_unknown_without_an_outcome(
     assert captured["meta_data"] == {"cleanup": "stuck_processing_timeout"}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode, recorded",
+    [(ExecutionMode.EVAL, True), (ExecutionMode.TELEPHONY, False)],
+)
+async def test_completion_without_a_dispatch_config(
+    monkeypatch: pytest.MonkeyPatch, mode: ExecutionMode, recorded: bool
+) -> None:
+    """A brand-new agent has no dispatch config: its eval runs must still record
+    their result, while other leads keep the config gate as before."""
+    lead = make_lead().model_copy(update={"execution_mode": mode})
+    written: List[Dict[str, Any]] = []
+
+    async def noop(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def the_lead(_call_id: str) -> LeadCallTracker:
+        return lead
+
+    async def no_redis() -> Any:
+        raise RuntimeError("no redis in tests")
+
+    async def save(**kwargs: Any) -> LeadCallTracker:
+        written.append(kwargs)
+        return lead
+
+    monkeypatch.setattr(calls_mod, "safe_release_pod", noop)
+    monkeypatch.setattr(calls_mod, "get_lead_by_call_id", the_lead)
+    monkeypatch.setattr(calls_mod, "get_redis_service", no_redis)
+    monkeypatch.setattr(calls_mod, "_release_call_resources", noop)
+    monkeypatch.setattr(calls_mod, "_get_lead_config", noop)
+    monkeypatch.setattr(calls_mod, "update_lead_call_completion_details", save)
+
+    await calls_mod.handle_call_completion(call_id=CALL_SID, outcome="BUSY")
+
+    assert bool(written) is recorded
+    if recorded:
+        assert written[0]["status"] == LeadCallStatus.FINISHED
+        assert written[0]["outcome"] == "BUSY"
+
+
+@pytest.mark.asyncio
+async def test_reaper_closes_a_stuck_eval_lead_without_paging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An eval session has no caller or carrier; its runner reports it."""
+    lead = make_lead().model_copy(update={"execution_mode": ExecutionMode.EVAL})
+
+    captured = await _run_reaper_capturing_close(monkeypatch, lead)
+
+    assert "alert" not in captured
+    assert captured["status"] == LeadCallStatus.FINISHED
+
+
 # ---------------------------------------------------------------------------
 # reconcile_stuck_processing_leads — old is not dead: never close a live call
 # ---------------------------------------------------------------------------

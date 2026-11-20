@@ -90,6 +90,18 @@ def test_query_always_carries_both_contact_branches():
     assert '"id" IS DISTINCT FROM' not in text
 
 
+def test_query_never_counts_an_eval_session_as_a_contact():
+    """An eval lead dials no one and carries the template's example number,
+    so it must not put a real customer with that number on cooldown."""
+    text, _ = count_recent_contacted_leads_query(
+        customer_mobile_number="9876543210",
+        reseller_id="res-1",
+        window_start=WINDOW_START,
+    )
+
+    assert "\"execution_mode\" <> 'EVAL'" in text
+
+
 def test_query_optional_filters_append_in_order():
     """merchant_id, request_id and lead_id exclusions must land as $4/$5/$6
     in that exact order — the accessor passes them by position."""

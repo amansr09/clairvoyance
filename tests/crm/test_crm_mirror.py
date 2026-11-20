@@ -33,6 +33,8 @@ def test_event_key_qualifies_by_topic() -> None:
 def test_test_execution_modes_are_excluded() -> None:
     assert is_non_customer_lead("TELEPHONY_TEST", None) is True
     assert is_non_customer_lead("DAILY_TEST", {}) is True
+    # An eval session's caller is simulated, never a customer.
+    assert is_non_customer_lead("EVAL", None) is True
 
 
 def test_non_customer_production_modes_are_excluded() -> None:

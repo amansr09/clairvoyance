@@ -1110,6 +1110,8 @@ def count_recent_contacted_leads_query(
         f"'{LeadCallStatus.PROCESSING.value}') AND \"updated_at\" >= $2))",
         "RIGHT(regexp_replace(\"payload\"->>'customer_mobile_number', '\\D', '', 'g'), 10) "
         "= RIGHT(regexp_replace($3, '\\D', '', 'g'), 10)",
+        # An eval session dials no one; its number is the template's example.
+        "\"execution_mode\" <> 'EVAL'",
     ]
 
     if merchant_id:

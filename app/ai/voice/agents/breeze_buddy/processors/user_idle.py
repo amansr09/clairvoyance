@@ -25,6 +25,8 @@ import asyncio
 from typing import Any, Awaitable, Callable, Optional
 
 from pipecat.frames.frames import LLMMessagesAppendFrame
+from pipecat.observers.base_observer import BaseObserver, FramePushed
+from pipecat.processors.frameworks.rtvi.frames import RTVISendTextFrame
 
 from app.core.logger import logger
 
@@ -115,3 +117,19 @@ class UserIdleCallbackHandler:
                 f"(retry_count={self.retry_count}, max_retries={self.max_retries})"
             )
             return False
+
+
+class SentTextObserver(BaseObserver):
+    """Reports a user turn the client typed (an RTVI ``send-text``).
+
+    A typed turn goes straight into the LLM context and never starts a user
+    turn on the aggregator, so idle handling would take the user for silent.
+    """
+
+    def __init__(self, on_user_text: Callable[[], None], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._on_user_text = on_user_text
+
+    async def on_push_frame(self, data: FramePushed) -> None:
+        if data.first_push and isinstance(data.frame, RTVISendTextFrame):
+            self._on_user_text()

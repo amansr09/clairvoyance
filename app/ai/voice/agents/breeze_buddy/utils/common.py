@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 from pipecat.frames.frames import OutputAudioRawFrame
 from pydub import AudioSegment
 
+from app.ai.voice.agents.breeze_buddy.handlers.transport.eval_http import EvalHttp
 from app.ai.voice.llm.types import RealtimeLLMProvider
 from app.core.config.static import ORDER_CONFIRMATION_WEBHOOK_SECRET_KEY
 from app.core.logger import logger
@@ -179,6 +180,9 @@ async def send_webhook_with_retry(
     Returns:
         bool: True if successful, False if all attempts failed
     """
+    if isinstance(session, EvalHttp):
+        return session.respond("POST", url)[0] == 200
+
     payload = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
     signature = calculate_hmac_sha256(payload, ORDER_CONFIRMATION_WEBHOOK_SECRET_KEY)
     headers = {"Content-Type": "application/json"}

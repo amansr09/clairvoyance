@@ -29,6 +29,7 @@ from urllib.parse import urlencode, urlparse
 import aiohttp
 from pydantic import SecretStr
 
+from app.ai.voice.agents.breeze_buddy.handlers.transport.eval_http import EvalHttp
 from app.ai.voice.agents.breeze_buddy.handlers.transport.utils.field_resolver import (
     replace_placeholders,
 )
@@ -56,12 +57,13 @@ from app.core.network import (
 class HttpRequestExecutor:
     """Executes HTTP requests with authentication, retry, and error handling"""
 
-    def __init__(self, session: aiohttp.ClientSession):
+    def __init__(self, session: aiohttp.ClientSession | EvalHttp):
         """
         Initialize executor with aiohttp session.
 
         Args:
-            session: Shared aiohttp.ClientSession (with proxy support from context)
+            session: Shared aiohttp.ClientSession (with proxy support from context),
+                or an eval session's EvalHttp, which answers from fixtures
         """
         self.session = session
 
@@ -128,6 +130,10 @@ class HttpRequestExecutor:
 
             # Build full URL with query params
             url = self._build_url_with_params(resolved_url, resolved_query_params)
+
+            if isinstance(self.session, EvalHttp):
+                status, text = self.session.respond(config.method.value, url)
+                return None if fire_and_forget else (status, text)
 
             # SSRF Protection: Validate the resolved URL before making the request
             self._validate_resolved_url(url)
