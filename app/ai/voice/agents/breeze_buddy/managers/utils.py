@@ -157,8 +157,11 @@ async def prepare_and_store_initial_greeting(
         initial_greeting = template.configurations.initial_greeting
         redis = await get_redis_service()
 
-        # Check if greeting has variables
-        has_variables = greeting_has_variables(initial_greeting)
+        # A greeting with variables is per lead, as is a draft's
+        # (TemplateModel.is_draft).
+        has_variables = greeting_has_variables(initial_greeting) or getattr(
+            template, "is_draft", False
+        )
 
         if has_variables:
             # Dynamic greeting - check if already exists for this lead
@@ -293,10 +296,14 @@ async def ensure_realtime_opening_line_cached(
     (LLM speaks first). Never raises; returns None on every skip/failure so
     the call fails open.
 
+    A draft is skipped (TemplateModel.is_draft).
+
     Returns:
         The opening-line text if audio is cached (or was just generated),
         None otherwise.
     """
+    if getattr(template, "is_draft", False):
+        return None
     configs = getattr(template, "configurations", None)
     initial_greeting = getattr(configs, "initial_greeting", None)
     if not initial_greeting:
@@ -359,7 +366,10 @@ async def ensure_realtime_opening_line_cached(
 
 def realtime_opening_line_applies(template) -> bool:
     """True when a saved template should have a pre-generated opening line:
-    Gemini realtime + a non-empty initial_greeting."""
+    Gemini realtime + a non-empty initial_greeting, and not a draft
+    (TemplateModel.is_draft)."""
+    if getattr(template, "is_draft", False):
+        return False
     configs = getattr(template, "configurations", None)
     if not configs or not getattr(configs, "initial_greeting", None):
         return False

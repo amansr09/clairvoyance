@@ -75,6 +75,7 @@ from app.ai.voice.agents.breeze_buddy.services.call_limiter import (
     unrecord_call_limit,
 )
 from app.ai.voice.agents.breeze_buddy.services.telephony.utils import get_voice_provider
+from app.ai.voice.agents.breeze_buddy.template.loader import DRAFT_EXECUTION_MODES
 from app.ai.voice.agents.breeze_buddy.template.types import TemplateModel
 from app.ai.voice.agents.breeze_buddy.utils.common import _gemini_realtime_config
 from app.ai.voice.agents.breeze_buddy.utils.playground import (
@@ -95,6 +96,7 @@ from app.database.accessor import (
     acquire_lock_on_lead_by_id,
     defer_lead_next_attempt_and_release_lock,
     get_lead_by_id,
+    get_live_template_by_id,
     get_template_by_id,
     is_number_blacklisted,
     release_lock_on_lead_by_id,
@@ -460,12 +462,14 @@ class Worker:
                 return
 
             # id-only resolution: leads always carry the template_id they
-            # resolved to at push time; name fallback was removed.
-            template = (
-                await get_template_by_id(locked.template_id)
-                if locked.template_id
-                else None
+            # resolved to at push time; name fallback was removed. A test
+            # lead dials the draft head, any other the published version.
+            load = (
+                get_template_by_id
+                if locked.execution_mode in DRAFT_EXECUTION_MODES
+                else get_live_template_by_id
             )
+            template = await load(locked.template_id) if locked.template_id else None
             if not template:
                 logger.error(
                     f"Worker {self._uuid}: no template found for lead "

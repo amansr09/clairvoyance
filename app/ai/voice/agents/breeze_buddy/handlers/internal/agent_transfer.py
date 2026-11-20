@@ -14,7 +14,10 @@ target leaves the current agent fully healthy.
 from typing import Any, Dict, List, Optional
 
 from app.ai.voice.agents.breeze_buddy.template.context import TemplateContext
-from app.ai.voice.agents.breeze_buddy.template.loader import FlowConfigLoader
+from app.ai.voice.agents.breeze_buddy.template.loader import (
+    DRAFT_EXECUTION_MODES,
+    FlowConfigLoader,
+)
 from app.ai.voice.agents.breeze_buddy.template.types import (
     FlowMode,
     GlobalBuiltinFunction,
@@ -76,6 +79,7 @@ async def connect_to_agent(
             reseller_id=bot.lead.reseller_id,
             template_id=target_template_id,
             call_payload=bot.lead.payload,
+            draft=bot.lead.execution_mode in DRAFT_EXECUTION_MODES,
         )
         validate_template_compat(template)
         if template.flow.get("mode") == FlowMode.IVR.value:

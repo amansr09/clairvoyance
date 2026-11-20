@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, cast
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import WebSocket
+from fastapi import HTTPException, WebSocket
 from pipecat.evals.results import (
     EvalAssertionFailure,
     EvalScriptResult,
@@ -21,6 +21,12 @@ from pipecat.evals.results import (
 from pipecat.evals.script import EvalScriptScenario, EvalSendAfter
 from pipecat.evals.simulation import EvalSimulationScenario
 
+from app.ai.voice.agents.breeze_buddy.agent.flow import load_template_config
+from app.ai.voice.agents.breeze_buddy.managers import utils as manager_utils
+from app.ai.voice.agents.breeze_buddy.managers.utils import (
+    ensure_realtime_opening_line_cached,
+    realtime_opening_line_applies,
+)
 from app.ai.voice.agents.breeze_buddy.scenario_tests import (
     access,
     checklist,
@@ -38,15 +44,20 @@ from app.ai.voice.agents.breeze_buddy.scenario_tests.scenario import (
     BuddySpec,
     from_mapping,
 )
+from app.ai.voice.agents.breeze_buddy.template import loader as loader_module
 from app.ai.voice.agents.breeze_buddy.template.types import (
     TemplateModel,
 )
+from app.ai.voice.agents.breeze_buddy.types.models import PushLeadRequest
+from app.ai.voice.llm.types import RealtimeLLMProvider
 from app.api.routers.breeze_buddy import eval as eval_route
+from app.api.routers.breeze_buddy.leads import handlers as lead_handlers
 from app.database.accessor.breeze_buddy import template as template_accessor
 from app.database.queries.breeze_buddy.template import restore_template_head_query
 from app.database.queries.breeze_buddy.template_version import (
     prune_template_versions_query,
 )
+from app.schemas.breeze_buddy.auth import UserInfo, UserRole
 from app.schemas.breeze_buddy.core import ExecutionMode, LeadCallStatus, LeadCallTracker
 
 TEMPLATE_ID = "11111111-1111-1111-1111-111111111111"
@@ -107,6 +118,10 @@ def _template(**overrides: Any) -> TemplateModel:
     }
     values.update(overrides)
     return TemplateModel(**values)
+
+
+def _user(role: UserRole = UserRole.ADMIN) -> UserInfo:
+    return UserInfo(id="u1", username="asha", role=role)
 
 
 # --- writing scenarios -------------------------------------------------------
@@ -302,6 +317,33 @@ def test_a_blank_outcome_expects_none():
     assert BuddySpec(outcome=["", "CONFIRM"]).outcomes == ["CONFIRM"]
 
 
+@pytest.mark.parametrize(
+    "mode, reads_live",
+    [(ExecutionMode.TELEPHONY, True), (ExecutionMode.TELEPHONY_TEST, False)],
+)
+async def test_a_pushed_lead_is_checked_against_the_version_it_will_run(
+    monkeypatch, mode, reads_live
+):
+    head, live = AsyncMock(return_value=None), AsyncMock(return_value=None)
+    monkeypatch.setattr(lead_handlers, "get_template_by_id", head)
+    monkeypatch.setattr(lead_handlers, "get_live_template_by_id", live)
+    request = PushLeadRequest.model_validate(
+        {
+            "request_id": "r1",
+            "payload": {},
+            "template_id": TEMPLATE_ID,
+            "reseller_id": "breeze",
+            "execution_mode": mode,
+        }
+    )
+
+    with pytest.raises(HTTPException):
+        await lead_handlers.push_lead_handler(request, _user())
+
+    assert (live if reads_live else head).await_count == 1
+    assert (head if reads_live else live).await_count == 0
+
+
 # --- drafts: what real calls run ------------------------------------------------
 
 
@@ -359,6 +401,44 @@ async def test_an_unreadable_published_version_serves_the_head(monkeypatch):
     assert await template_accessor.get_live_template_by_id(TEMPLATE_ID) is head
 
 
+@pytest.mark.parametrize(
+    "mode, draft",
+    [
+        (ExecutionMode.EVAL, True),
+        (ExecutionMode.TELEPHONY_TEST, True),
+        (ExecutionMode.DAILY_TEST, True),
+        (ExecutionMode.TELEPHONY, False),
+        (ExecutionMode.DAILY, False),
+    ],
+)
+async def test_test_calls_run_the_draft_and_real_calls_the_published_version(
+    monkeypatch, mode, draft
+):
+    loaded: List[str] = []
+
+    async def head(template_id):
+        loaded.append("head")
+        return _template()
+
+    async def live(template_id):
+        loaded.append("live")
+        return _template()
+
+    monkeypatch.setattr(loader_module, "get_template_by_id", head)
+    monkeypatch.setattr(loader_module, "get_live_template_by_id", live)
+    lead = LeadCallTracker(
+        id="lead-1",
+        reseller_id="breeze",
+        template="cod-confirm",
+        template_id=TEMPLATE_ID,
+        execution_mode=mode,
+    )
+
+    await load_template_config(lead)
+
+    assert loaded == ["head" if draft else "live"]
+
+
 def test_the_version_real_calls_run_is_never_pruned():
     query, _ = prune_template_versions_query(TEMPLATE_ID, 20, 10)
     assert "published_version" in query
@@ -384,6 +464,38 @@ def test_a_restored_draft_keeps_the_secrets_real_calls_use():
     assert "WHEN $12::boolean AND $13::integer IS NOT NULL" in query
     assert "THEN secrets ELSE $6::jsonb END" in query
     assert values[5] == '{"k": "v2"}'
+
+
+def _gemini_greeting_template(is_draft: bool) -> Any:
+    realtime = SimpleNamespace(provider=RealtimeLLMProvider.GEMINI)
+    configurations = SimpleNamespace(
+        initial_greeting="Namaste, this is Buddy.",
+        llm_configurations=SimpleNamespace(realtime=realtime),
+    )
+    return SimpleNamespace(
+        id=TEMPLATE_ID, is_draft=is_draft, configurations=configurations
+    )
+
+
+async def test_a_drafts_greeting_never_lands_in_the_shared_greeting_audio(
+    monkeypatch,
+):
+    """The template key holds the opening line real calls play: a draft's
+    neither reads nor regenerates it."""
+    redis = SimpleNamespace(get=AsyncMock(return_value=b"audio"))
+    monkeypatch.setattr(
+        manager_utils, "get_redis_service", AsyncMock(return_value=redis)
+    )
+    published = _gemini_greeting_template(is_draft=False)
+    draft = _gemini_greeting_template(is_draft=True)
+
+    assert realtime_opening_line_applies(published)
+    assert not realtime_opening_line_applies(draft)
+    assert await ensure_realtime_opening_line_cached(published) == (
+        "Namaste, this is Buddy."
+    )
+    assert await ensure_realtime_opening_line_cached(draft) is None
+    assert redis.get.await_count == 1
 
 
 def test_a_head_that_is_the_published_version_is_not_a_draft():

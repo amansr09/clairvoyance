@@ -511,7 +511,8 @@ async def prepare_initial_greeting_payload(
             # Freshness comes from PUT/DELETE invalidation, not TTL.
             # Greetings are static, so the playback text is simply the
             # template's initial_greeting.
-            if template:
+            # A draft's greeting is per lead (TemplateModel.is_draft).
+            if template and not getattr(template, "is_draft", False):
                 template_audio_key = f"greeting:template:{template.id}"
                 template_greeting = await redis.get(template_audio_key)
                 if template_greeting:

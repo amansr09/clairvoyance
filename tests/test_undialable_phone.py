@@ -115,7 +115,7 @@ def _template_resolves(monkeypatch):
     async def _get(_id):
         return _template()
 
-    monkeypatch.setattr(lead_handlers, "get_template_by_id", _get)
+    monkeypatch.setattr(lead_handlers, "get_live_template_by_id", _get)
 
 
 @pytest.mark.parametrize(

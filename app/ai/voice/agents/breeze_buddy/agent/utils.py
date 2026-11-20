@@ -189,7 +189,12 @@ async def send_initial_greeting_daily(
         # line — same key, raw base64 mulaw, kept fresh by PUT/DELETE
         # invalidation. Greetings are static, so the playback text is the
         # template's initial_greeting itself.
-        template_greeting = await redis.get(f"greeting:template:{template.id}")
+        # A draft's greeting is per lead (TemplateModel.is_draft).
+        template_greeting = (
+            None
+            if template.is_draft
+            else await redis.get(f"greeting:template:{template.id}")
+        )
         if template_greeting:
             mulaw_data = base64.b64decode(template_greeting)
             greeting_source = "template_static"

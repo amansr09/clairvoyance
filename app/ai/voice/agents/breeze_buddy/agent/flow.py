@@ -11,7 +11,10 @@ from app.ai.voice.agents.breeze_buddy.services.knowledge_base import (
     build_kb_system_message,
 )
 from app.ai.voice.agents.breeze_buddy.template.builder import FlowConfigBuilder
-from app.ai.voice.agents.breeze_buddy.template.loader import FlowConfigLoader
+from app.ai.voice.agents.breeze_buddy.template.loader import (
+    DRAFT_EXECUTION_MODES,
+    FlowConfigLoader,
+)
 from app.ai.voice.agents.breeze_buddy.template.types import (
     ConfigurationModel,
     TemplateModel,
@@ -45,6 +48,7 @@ async def load_template_config(
         reseller_id=lead.reseller_id,
         template_id=lead.template_id,
         call_payload=lead.payload,
+        draft=lead.execution_mode in DRAFT_EXECUTION_MODES,
     )
 
     # Apply overrides and re-render if playground mode

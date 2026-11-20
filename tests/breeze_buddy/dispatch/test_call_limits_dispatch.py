@@ -155,6 +155,7 @@ async def test_the_record_comes_after_the_greeting_prewarm(
         limiter.events.append(("prewarm", None))
 
     monkeypatch.setattr(w, "get_template_by_id", _template)
+    monkeypatch.setattr(w, "get_live_template_by_id", _template)
     monkeypatch.setattr(w, "_prewarm_initial_greeting_with_retry", _prewarm)
 
     await _dispatch(harness, fake_redis, make_lead("lead-1"))

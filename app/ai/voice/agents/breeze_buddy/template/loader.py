@@ -16,10 +16,20 @@ from app.database.accessor.breeze_buddy.credentials import (
     get_credentials_as_template_vars,
 )
 from app.database.accessor.breeze_buddy.template import (
+    get_live_template_by_id,
     get_template_by_id,
 )
+from app.schemas.breeze_buddy.core import ExecutionMode
 from app.utils.transformation import (
     TEMPLATE_FUNCTION_REGISTRY,
+)
+
+# Test calls run the head — the draft an editor is working on, before its agent
+# tests pass; every other call runs the published version.
+DRAFT_EXECUTION_MODES = (
+    ExecutionMode.EVAL,
+    ExecutionMode.TELEPHONY_TEST,
+    ExecutionMode.DAILY_TEST,
 )
 
 
@@ -29,10 +39,12 @@ class FlowConfigLoader:
     async def _load_template_from_db(
         self,
         template_id: Optional[str],
+        draft: bool = False,
     ) -> Optional[TemplateModel]:
         """
         Load complete template from database by id (id-only — name-based
-        resolution was removed).
+        resolution was removed). ``draft`` loads the head even while it waits
+        for its agent tests; otherwise the version real calls run.
 
         Returns:
             TemplateModel if found, None otherwise
@@ -41,7 +53,11 @@ class FlowConfigLoader:
             logger.error("No template_id provided — cannot load template")
             return None
 
-        template = await get_template_by_id(template_id)
+        template = await (
+            get_template_by_id(template_id)
+            if draft
+            else get_live_template_by_id(template_id)
+        )
 
         if template:
             nodes_count = len(template.flow.get("nodes", []))
@@ -106,6 +122,7 @@ class FlowConfigLoader:
         reseller_id: str,
         template_id: Optional[str],
         call_payload: Optional[Dict[str, str]] = None,
+        draft: bool = False,
     ) -> Tuple[TemplateModel, Dict[str, str]]:
         """
         Load template by id and render task messages with variables.
@@ -115,6 +132,7 @@ class FlowConfigLoader:
             template_id: Template UUID (the ONLY resolution key — name-based
                 lookup was removed)
             call_payload: Optional payload variables
+            draft: Load the head even while it is a draft (test calls)
 
         Returns:
             TemplateModel with rendered task messages, and dictionary of template variables
@@ -124,7 +142,7 @@ class FlowConfigLoader:
         """
 
         # Load template from database
-        template_obj = await self._load_template_from_db(template_id)
+        template_obj = await self._load_template_from_db(template_id, draft)
 
         if not template_obj:
             raise ValueError(

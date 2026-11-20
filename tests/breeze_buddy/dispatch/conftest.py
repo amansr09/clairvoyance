@@ -751,6 +751,11 @@ def harness(monkeypatch, fake_redis) -> DispatchHarness:
         "get_template_by_id",
         h.get_template_by_id,
     )
+    monkeypatch.setattr(
+        worker_mod,
+        "get_live_template_by_id",
+        h.get_template_by_id,
+    )
     monkeypatch.setattr(worker_mod, "is_number_blacklisted", h.is_number_blacklisted)
 
     # managers.calls helpers.
