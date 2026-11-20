@@ -916,6 +916,13 @@ async def AZURE_OPENAI_REALTIME_ENDPOINT() -> str:
     return await get_config("AZURE_OPENAI_REALTIME_ENDPOINT", "", str)
 
 
+# --- Agent tests (scenario_tests/, docs/SCENARIO_EVALS.md) ---
+async def AGENT_TESTS_ENABLED() -> bool:
+    """Gate a voice agent's going live on its agent tests (default off).
+    See docs/SCENARIO_EVALS.md."""
+    return await get_config("AGENT_TESTS_ENABLED", False, bool)
+
+
 # --- Knowledge Base (RAG) ---
 async def KB_AZURE_OPENAI_ENDPOINT() -> str:
     """Azure endpoint for the ``azure_openai`` EMBEDDING provider (the

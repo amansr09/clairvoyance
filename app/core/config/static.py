@@ -503,6 +503,8 @@ def _flag(env_var: str, default_main_server: bool, default_agent_pool: bool) -> 
 
 ENABLE_DISPATCHER = _flag("ENABLE_DISPATCHER", True, False)
 ENABLE_EVALUATIONS_WORKER = _flag("ENABLE_EVALUATIONS_WORKER", False, False)
+# Agent-tests pod only: it serves the eval route's test calls.
+ENABLE_AGENT_TESTS_WORKER = _flag("ENABLE_AGENT_TESTS_WORKER", False, False)
 
 # Promoter
 BB_PROMOTER_TICK_MS = int(os.environ.get("BB_PROMOTER_TICK_MS", 200))
@@ -875,6 +877,24 @@ TEMPLATE_BUILDER_VERTEX_CLAUDE_MODEL = os.environ.get(
 )
 TEMPLATE_BUILDER_MAX_TOKENS = int(
     os.environ.get("TEMPLATE_BUILDER_MAX_TOKENS", "16000")
+)
+
+# --- Agent tests (switched by dynamic AGENT_TESTS_ENABLED) ---
+# Read by the agent-tests worker (ENABLE_AGENT_TESTS_WORKER) only.
+# Bedrock models, in the default LLM's region: the judge and the simulated
+# caller; the writer of each agent's scenarios gets the stronger model (Sonnet
+# 4.5 has no India inference profile, so global; it sees only the agent's setup).
+AGENT_TESTS_JUDGE_MODEL = os.environ.get(
+    "AGENT_TESTS_JUDGE_MODEL", "in.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
+AGENT_TESTS_CALLER_MODEL = os.environ.get(
+    "AGENT_TESTS_CALLER_MODEL", "in.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
+AGENT_TESTS_WRITER_MODEL = os.environ.get(
+    "AGENT_TESTS_WRITER_MODEL", "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+)
+AGENT_TESTS_WRITER_MAX_TOKENS = int(
+    os.environ.get("AGENT_TESTS_WRITER_MAX_TOKENS", "8192")
 )
 
 # LangFuse Configuration (for OpenTelemetry tracing only)

@@ -46,6 +46,7 @@ from app.api.routers.breeze_buddy.demo import router as demo_router
 
 # DragonTTS kill switch (admin-only one-directional TTS failover)
 from app.api.routers.breeze_buddy.dragontts import router as dragontts_router
+from app.api.routers.breeze_buddy.eval import router as eval_router
 from app.api.routers.breeze_buddy.evaluations import router as evaluations_router
 
 # Knowledge base (RAG) management: KBs, documents, retrieval testing
@@ -85,7 +86,7 @@ from app.api.routers.breeze_buddy.websocket import router as websocket_router
 # (anonymous, public_widget_key + Origin gated).
 from app.api.routers.breeze_buddy.widget import router as widget_router
 from app.api.routers.breeze_buddy.widget_config import router as widget_config_router
-from app.core.config.static import UAP_ROUTES_ENABLED
+from app.core.config.static import ENABLE_AGENT_TESTS_WORKER, UAP_ROUTES_ENABLED
 
 router = APIRouter()
 
@@ -114,6 +115,11 @@ router.include_router(credentials_router, prefix="", tags=["credentials"])
 # UAP routes. Off by default for security: see UAP_ROUTES_ENABLED.
 if UAP_ROUTES_ENABLED:
     router.include_router(uap_router, prefix="/uap", tags=["UAP"])
+
+# Eval harness websocket: only on the agent-tests worker's pods, which serve
+# their own suites' test calls; refuses every session while tests are off.
+if ENABLE_AGENT_TESTS_WORKER:
+    router.include_router(eval_router, prefix="", tags=["eval"])
 
 # Telephony numbers (caller IDs + inbound DIDs)
 router.include_router(numbers_router, prefix="", tags=["numbers"])

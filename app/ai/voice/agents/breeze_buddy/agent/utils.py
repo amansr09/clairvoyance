@@ -8,9 +8,11 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import WebSocket
-from pipecat.frames.frames import OutputAudioRawFrame
+from pipecat.frames.frames import OutputAudioRawFrame, OutputTransportMessageFrame
 from pipecat.pipeline.task import PipelineTask
+from pipecat.processors.frameworks.rtvi.models import MESSAGE_LABEL
 
+from app.ai.voice.agents.breeze_buddy.managers.utils import resolve_initial_greeting
 from app.ai.voice.agents.breeze_buddy.template.types import TemplateModel
 from app.ai.voice.agents.breeze_buddy.utils.common import (
     prepare_initial_greeting_payload,
@@ -26,6 +28,7 @@ from app.services.redis.client import get_redis_service
 TRANSPORT_TYPE_DAILY = "daily"
 TRANSPORT_TYPE_TELEPHONY = "telephony"
 TRANSPORT_TYPE_VOBIZ = "vobiz"
+TRANSPORT_TYPE_EVAL = "eval"
 
 # Daily output runs at PipelineParams default (24 kHz, 16-bit, mono); the
 # telephony greeting cache stores mulaw 8 kHz, so we transcode at retrieval.
@@ -232,6 +235,24 @@ async def send_initial_greeting_daily(
         logger.error(f"Failed to send Daily initial greeting: {e}", exc_info=True)
         track_error(errors, f"Failed to send Daily initial greeting: {e}")
         return GreetingResult(source=None, text=None)
+
+
+def resolve_eval_greeting(
+    lead: LeadCallTracker, template: TemplateModel
+) -> GreetingResult:
+    """An eval session's greeting: injected like a played one, never synthesized."""
+    text = resolve_initial_greeting(template, lead.payload or {})
+    return GreetingResult(source="eval" if text else None, text=text)
+
+
+async def report_greeting_to_eval(task: PipelineTask, text: str) -> None:
+    """Report the greeting to the eval harness as one bot response."""
+    messages = [
+        {"label": MESSAGE_LABEL, "type": "bot-llm-started"},
+        {"label": MESSAGE_LABEL, "type": "bot-llm-text", "data": {"text": text}},
+        {"label": MESSAGE_LABEL, "type": "bot-llm-stopped"},
+    ]
+    await task.queue_frames([OutputTransportMessageFrame(message=m) for m in messages])
 
 
 async def end_call_with_errors(

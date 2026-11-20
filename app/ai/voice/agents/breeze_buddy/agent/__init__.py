@@ -10,7 +10,11 @@ from opentelemetry import trace
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.flows import FlowManager
-from pipecat.frames.frames import LLMMessagesAppendFrame, TTSSpeakFrame
+from pipecat.frames.frames import (
+    LLMConfigureOutputFrame,
+    LLMMessagesAppendFrame,
+    TTSSpeakFrame,
+)
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -53,8 +57,11 @@ from app.ai.voice.agents.breeze_buddy.agent.transport import (
 )
 from app.ai.voice.agents.breeze_buddy.agent.utils import (
     TRANSPORT_TYPE_DAILY,
+    TRANSPORT_TYPE_EVAL,
     TRANSPORT_TYPE_VOBIZ,
     end_call_with_errors,
+    report_greeting_to_eval,
+    resolve_eval_greeting,
     send_initial_greeting,
     send_initial_greeting_daily,
 )
@@ -63,6 +70,7 @@ from app.ai.voice.agents.breeze_buddy.chat.voice_bridge import WidgetVoiceBridge
 from app.ai.voice.agents.breeze_buddy.handlers.internal.end_conversation import (
     end_conversation,
 )
+from app.ai.voice.agents.breeze_buddy.handlers.transport.eval_http import EvalHttp
 from app.ai.voice.agents.breeze_buddy.ivr.selection import (
     BLOCK_MESSAGE_PLAY_SECONDS,
     _send_audio,
@@ -81,6 +89,7 @@ from app.ai.voice.agents.breeze_buddy.observers import ObserverManager, build_ob
 from app.ai.voice.agents.breeze_buddy.processors import (
     KnowledgeRetrievalProcessor,
     MetricsCollectorProcessor,
+    SentTextObserver,
     TranscriptCollectorProcessor,
 )
 from app.ai.voice.agents.breeze_buddy.processors.voice_ui_stream import (
@@ -144,12 +153,17 @@ from app.core.logger.context import (
 )
 from app.database.accessor import get_lead_by_call_id, update_lead_call_initiated_time
 from app.database.accessor.breeze_buddy.lead_call_tracker import (
+    get_lead_by_id,
     update_lead_call_initiated_time_by_id,
     update_lead_template,
 )
 from app.database.accessor.breeze_buddy.template import get_template_by_id
 from app.schemas import CallProvider
-from app.schemas.breeze_buddy.core import ExecutionMode, LeadCallTracker
+from app.schemas.breeze_buddy.core import (
+    ExecutionMode,
+    LeadCallStatus,
+    LeadCallTracker,
+)
 
 DEFAULT_OUTCOME = "BUSY"
 TTS_SPEAK_MAX_CHARS = 2000
@@ -171,6 +185,7 @@ class Agent:
         completion_function: Optional[Callable] = None,
         provider: Optional[str] = None,
         telephony_service: Optional[VoiceCallProvider] = None,
+        eval_lead_id: Optional[str] = None,
     ):
         # Transport configuration
         self.transport_type = transport_type
@@ -179,6 +194,7 @@ class Agent:
         self.provider = provider
         self.completion_function = completion_function
         self.telephony_service = telephony_service
+        self.eval_lead_id = eval_lead_id  # Eval sessions: the EVAL lead driven
 
         # Runtime state
         self.task: Optional[PipelineTask] = None
@@ -298,6 +314,10 @@ class Agent:
         return self.transport_type == TRANSPORT_TYPE_DAILY
 
     @property
+    def is_eval_mode(self) -> bool:
+        return self.transport_type == TRANSPORT_TYPE_EVAL
+
+    @property
     def is_stream_mode(self) -> bool:
         return (
             self.lead is not None
@@ -324,6 +344,18 @@ class Agent:
             await self._rtvi_processor.push_frame(RTVIServerMessageFrame(data=data))
         except Exception as e:
             logger.warning(f"Failed to emit RTVI event '{event_type}': {e}")
+
+    def _note_user_spoke(self) -> None:
+        """Stop the post-greeting timer and reset idle retries: the user is engaged."""
+        if not self._user_idle_callback_handler:
+            return
+        if not self._user_spoke:
+            self._user_spoke = True
+            if self._post_greeting_task:
+                self._post_greeting_task.cancel()
+                self._post_greeting_task = None
+                logger.debug("Post-greeting timer cancelled - user spoke")
+        self._user_idle_callback_handler.reset_retry_count()
 
     async def _handle_user_idle_timeout(self, idle_retry_count: int) -> None:
         """Handle user idle timeout by ending call with BUSY outcome.
@@ -794,6 +826,91 @@ class Agent:
         logger.info(f"Created transport: {self.transport.__class__.__name__}")
         return True
 
+    async def _setup_eval_transport(self) -> bool:
+        """Initialize the transport for an eval harness session. Returns False if refused.
+
+        Only a text-mode ``eval-connect`` for an EVAL lead no session has started
+        is accepted; anything else is refused before the lead is touched.
+        """
+        if not self.ws or not self.eval_lead_id:
+            logger.error("Eval session without a websocket or lead id")
+            return False
+        await self.ws.accept()
+        set_log_context(lead_id=str(self.eval_lead_id))
+
+        try:
+            transport_type, call_data = await asyncio.wait_for(
+                parse_telephony_websocket(self.ws), timeout=TELEPHONY_START_TIMEOUT_S
+            )
+        except (TimeoutError, ValueError) as e:
+            logger.warning(f"No eval-connect message: {e!r}")
+            await close_websocket_safely(self.ws, code=1000, reason="No eval-connect")
+            return False
+
+        lead = await get_lead_by_id(self.eval_lead_id)
+        if (
+            transport_type != TRANSPORT_TYPE_EVAL
+            or not call_data.body.get("skip_tts")
+            or not lead
+            or lead.execution_mode != ExecutionMode.EVAL
+            or lead.status != LeadCallStatus.PROCESSING
+            or lead.call_initiated_time
+        ):
+            logger.warning(f"Refusing eval session for lead {self.eval_lead_id}")
+            await close_websocket_safely(self.ws, code=4003, reason="Not an eval lead")
+            return False
+
+        # Every refusal comes before the lead is marked started: a started lead
+        # left PROCESSING is closed by the stuck-call sweeper, not by the session.
+        try:
+            eval_http = EvalHttp(((lead.metaData or {}).get("eval") or {}).get("http"))
+            (
+                self.template,
+                self.configurations,
+                self.template_vars,
+            ) = await load_template_config(lead)
+        except Exception as e:
+            logger.error(f"Eval session setup failed: {e}")
+            await close_websocket_safely(self.ws, code=4000, reason="Eval setup failed")
+            return False
+
+        self.lead = await update_lead_call_initiated_time_by_id(
+            lead.id, datetime.now(timezone.utc)
+        )
+        if not self.lead:
+            await close_websocket_safely(
+                self.ws, code=4000, reason="Lead update failed"
+            )
+            return False
+        self.call_sid = self.lead.call_id
+        update_log_context(call_sid=self.call_sid)
+        self.aiohttp_session = eval_http
+
+        self.flow_builder = FlowConfigBuilder()
+        for handler_name, handler_func in self.flow_builder.handler_map.items():
+            self.flow_builder.handler_map[handler_name] = with_context(self)(
+                handler_func
+            )
+
+        self.vad_analyzer, self.default_vad_params = await create_vad_analyzer(
+            is_daily_mode=False,
+            template=self.template,
+        )
+        params = get_transport_params(self.template, self.configurations)[
+            TRANSPORT_TYPE_EVAL
+        ]()
+        self._rebuild.telephony_transport_type = TRANSPORT_TYPE_EVAL
+        self._rebuild.telephony_call_data = call_data
+        self._rebuild.ws_proxy = NonClosingWebSocket(self.ws)
+        self.transport = await create_telephony_transport(
+            cast(WebSocket, self._rebuild.ws_proxy),
+            params,
+            TRANSPORT_TYPE_EVAL,
+            call_data,
+        )
+        logger.info(f"Eval session ready for lead {self.lead.id}")
+        return True
+
     async def _handle_block_redirect(self, transport_type: str) -> bool:
         """Handle Exotel block-redirect set at answer-time.
 
@@ -1008,14 +1125,7 @@ class Agent:
             @user_agg.event_handler("on_user_turn_started")
             async def on_user_turn_started(aggregator, strategy):
                 """Reset idle retry counter."""
-                if self._user_idle_callback_handler:
-                    if not self._user_spoke:
-                        self._user_spoke = True
-                        if self._post_greeting_task:
-                            self._post_greeting_task.cancel()
-                            self._post_greeting_task = None
-                            logger.debug("Post-greeting timer cancelled - user spoke")
-                    self._user_idle_callback_handler.reset_retry_count()
+                self._note_user_spoke()
 
             # Subscribe observer manager to pipeline events
             if self._observer_manager:
@@ -1134,15 +1244,27 @@ class Agent:
         # greeting_source/text here makes prepare_initial_node inject the
         # greeting into the LLM context as an assistant message and switch
         # respond_immediately=False — same downstream behavior as telephony.
-        # (Stream mode returned above — its greeting is spoken by the voice
-        # bridge, not injected into an LLM context.)
-        if self.is_daily_mode and not self.is_stream_mode and self.task:
-            greeting_result = await send_initial_greeting_daily(
-                task=self.task,
-                lead=self.lead,
-                template=self.template,
-                errors=self.errors,
-            )
+        # An eval session injects its greeting the same way and reports it to
+        # the harness once the flow is set up. (Stream mode returned above — its
+        # greeting is spoken by the voice bridge, not injected into an LLM
+        # context.)
+        if (
+            (self.is_daily_mode or self.is_eval_mode)
+            and not self.is_stream_mode
+            and self.task
+        ):
+            if self.is_eval_mode:
+                # Pipecat's eval transport sets skip_tts below the RTVI
+                # processor, which re-enables TTS after every typed turn.
+                await self.task.queue_frames([LLMConfigureOutputFrame(skip_tts=True)])
+                greeting_result = resolve_eval_greeting(self.lead, self.template)
+            else:
+                greeting_result = await send_initial_greeting_daily(
+                    task=self.task,
+                    lead=self.lead,
+                    template=self.template,
+                    errors=self.errors,
+                )
             self.greeting_source = greeting_result.source
             self.greeting_text = greeting_result.text
 
@@ -1240,6 +1362,10 @@ class Agent:
         await self.flow_manager.initialize(initial_node_config)
         logger.info(f"FlowManager initialized at node: {initial_node_name}")
 
+        # Behind the node's context and tools, so an instant reply can't race them.
+        if self.is_eval_mode and self.greeting_text and self.task:
+            await report_greeting_to_eval(self.task, self.greeting_text)
+
     # ══════════════════════════════════════════════════════════════════════
     # Run loop & pipeline generation
     # ══════════════════════════════════════════════════════════════════════
@@ -1316,6 +1442,9 @@ class Agent:
                     logger.error("runner_args is required for Daily mode")
                     return
                 await self._setup_daily_transport(runner_args)
+            elif self.is_eval_mode:
+                if not await self._setup_eval_transport():
+                    return
             else:
                 if not await self._setup_telephony_transport():
                     if self.completion_function and self.call_sid:
@@ -1388,6 +1517,13 @@ class Agent:
                 self.pending_transfer = None
                 await apply_transfer(self, transfer)
 
+            # The harness hangs up an eval session by cancelling the pipeline,
+            # which skips on_client_disconnected; finalize it as a caller hang-up.
+            if self.is_eval_mode and not self.conversation_ended:
+                if self._post_greeting_task and not self._post_greeting_task.done():
+                    self._post_greeting_task.cancel()
+                await self._handle_unexpected_disconnect("client_disconnected")
+
             # The Agent owns the ONE real teardown at true call end — per-generation
             # teardown is suppressed so transfers never drop the connection.
             # Telephony: close the raw ws (NonClosingWebSocket swallowed pipecat's
@@ -1435,7 +1571,10 @@ class Agent:
                 ),
             )
         stt, llm, tts = await create_services(
-            self.configurations, include_llm=not is_stream, accounts=self.accounts
+            self.configurations,
+            include_llm=not is_stream,
+            accounts=self.accounts,
+            text_only=self.is_eval_mode,
         )
         # Telephony runs on the call's account too: the transfer and the
         # auto hang-up of this generation's transport.
@@ -1498,6 +1637,7 @@ class Agent:
             ),
             mode="stream" if is_stream else "agent",
             kb_processor=self._kb_processor,
+            is_eval_mode=self.is_eval_mode,
         )
         self._context_aggregator = context_aggregator
 
@@ -1523,7 +1663,10 @@ class Agent:
             self.conversation_id,
             is_daily_mode=self.is_daily_mode,
             metrics_collector=self.metrics_collector,
+            is_eval_mode=self.is_eval_mode,
         )
+        if self.is_eval_mode:
+            self.task.add_observer(SentTextObserver(self._note_user_spoke))
 
         if self.is_daily_mode and hasattr(self.task, "rtvi") and self.task.rtvi:
             self._rtvi_processor = self.task.rtvi
@@ -1716,6 +1859,44 @@ async def telephony_bot(
         telephony_service=telephony_service,
     )
     await agent.run()
+
+
+async def eval_bot(
+    ws: WebSocket,
+    lead_id: str,
+    completion_function: Callable,
+) -> None:
+    """Entry point for eval harness sessions."""
+    agent = Agent(
+        transport_type=TRANSPORT_TYPE_EVAL,
+        ws=ws,
+        completion_function=completion_function,
+        eval_lead_id=lead_id,
+    )
+    try:
+        await agent.run()
+    except Exception:
+        await _close_crashed_eval_lead(agent, completion_function)
+        raise
+
+
+async def _close_crashed_eval_lead(agent: Agent, completion_function: Callable) -> None:
+    """Close the lead of an eval session that crashed after it started, as a
+    failed telephony setup does; an eval session has no carrier webhook to do it."""
+    if not agent.lead or not agent.call_sid:
+        return
+    try:
+        lead = await get_lead_by_id(str(agent.lead.id))
+        if lead and lead.status != LeadCallStatus.FINISHED:
+            await completion_function(
+                call_id=agent.call_sid,
+                outcome="EARLY_HANGUP",
+                call_end_time=datetime.now(timezone.utc),
+            )
+    except Exception:
+        logger.opt(exception=True).error(
+            f"Could not close the crashed eval lead {agent.lead.id}"
+        )
 
 
 async def daily_bot(

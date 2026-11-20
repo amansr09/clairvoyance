@@ -92,6 +92,14 @@ def _resolve_greeting_text(
     return resolved_greeting
 
 
+def resolve_initial_greeting(template: TemplateModel, payload: dict) -> Optional[str]:
+    """The template's greeting as this lead would hear it; None when it has none."""
+    configurations = template.configurations
+    if not configurations or not configurations.initial_greeting:
+        return None
+    return _resolve_greeting_text(configurations.initial_greeting, payload, template)
+
+
 async def prepare_and_store_initial_greeting(
     lead_id: str,
     payload: dict,

@@ -8,6 +8,9 @@ audio I/O, sample rates, and optional audio filters/mixers.
 from typing import Any, Optional
 
 from fastapi import WebSocket
+from pipecat.evals.fastapi_transport import EvalFastAPIWebsocketTransport
+from pipecat.evals.serializer import EvalConnectionFlags, EvalSerializer
+from pipecat.evals.transport import EvalTransportParams
 from pipecat.runner.types import CallData
 from pipecat.runner.utils import _create_telephony_transport
 from pipecat.transports.base_transport import BaseTransport
@@ -22,6 +25,7 @@ from app.ai.voice.agents.breeze_buddy.agent.noise_filter import (
 )
 from app.ai.voice.agents.breeze_buddy.agent.utils import (
     TRANSPORT_TYPE_DAILY,
+    TRANSPORT_TYPE_EVAL,
     TRANSPORT_TYPE_TELEPHONY,
     TRANSPORT_TYPE_VOBIZ,
 )
@@ -134,6 +138,17 @@ def get_transport_params(
                 configurations, TRANSPORT_TYPE_TELEPHONY
             ),
         ),
+        # The eval harness stands in for the carrier: same audio path, RTVI wire.
+        "eval": lambda: EvalTransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            audio_in_sample_rate=TELEPHONY_SAMPLE_RATE,
+            audio_out_sample_rate=TELEPHONY_SAMPLE_RATE,
+            audio_out_mixer=telephony_mixer,
+            audio_in_filter=create_audio_input_filter(
+                configurations, TRANSPORT_TYPE_TELEPHONY
+            ),
+        ),
     }
 
 
@@ -149,9 +164,17 @@ async def create_telephony_transport(
     with a Plivo-shaped start event, so pipecat detects it as "plivo" and
     would hang up through api.plivo.com with PLIVO_* keys. The agent relabels
     those calls "vobiz" from the websocket path, and they get
-    VobizFrameSerializer here instead. Used by the first build and by the
-    agent-to-agent rebuild, so both stay on the same serializer.
+    VobizFrameSerializer here instead. An eval harness connection gets the
+    eval transport, built with the flags of its ``eval-connect`` message.
+    Used by the first build and by the agent-to-agent rebuild, so both stay
+    on the same serializer.
     """
+    if transport_type == TRANSPORT_TYPE_EVAL:
+        params.serializer = EvalSerializer()
+        return EvalFastAPIWebsocketTransport(
+            websocket, params, EvalConnectionFlags.model_validate(call_data.body)
+        )
+
     if transport_type != TRANSPORT_TYPE_VOBIZ:
         return await _create_telephony_transport(
             websocket, params, transport_type, call_data

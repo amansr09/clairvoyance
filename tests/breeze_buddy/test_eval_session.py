@@ -1,27 +1,35 @@
-"""The pieces an eval session runs on, and what an EVAL lead never reaches.
+"""An eval session on the bot side.
 
-Outbound HTTP is answered from the scenario's fixtures, a test call opens no
-vendor STT or TTS, and a reply nobody speaks still ends the bot's turn. An EVAL
-lead sends no alert, never shows in the call list or aggregates, and no pushed
-lead can claim the mode.
+The harness attaches like a carrier but speaks RTVI, and only an EVAL lead may
+be driven that way. Outbound HTTP is answered from the scenario's fixtures, the
+greeting reaches the harness once the flow is set up, and a reply nobody speaks
+still ends the bot's turn, so the end node can end the call as in production.
 """
 
 from __future__ import annotations
 
+import copy
+import importlib
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, List, cast
+from typing import Any, Dict, List, Optional, cast
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import WebSocket
+from pipecat.evals.serializer import EvalSerializer
+from pipecat.evals.transport import EvalTransportParams
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     Frame,
     InterruptionFrame,
+    LLMConfigureOutputFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
+    OutputTransportMessageFrame,
     TextFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
@@ -30,7 +38,9 @@ from pipecat.frames.frames import (
 from pipecat.observers.base_observer import FramePushed
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi.frames import RTVISendTextFrame
+from pipecat.runner.types import CallData
 from pipecat.tests.utils import run_test
+from starlette.websockets import WebSocketState
 
 # isort: off
 # template.types must load before the transport modules (reversing the
@@ -45,8 +55,17 @@ from app.database.queries.breeze_buddy.analytics.analytics import (
 )
 
 # isort: on
+from app.ai.voice.agents.breeze_buddy import agent as agent_mod
 from app.ai.voice.agents.breeze_buddy.agent import (
     pipeline as pipeline_mod,
+    utils as agent_utils,
+)
+from app.ai.voice.agents.breeze_buddy.agent.transport import (
+    create_telephony_transport,
+)
+from app.ai.voice.agents.breeze_buddy.agent.utils import (
+    TRANSPORT_TYPE_EVAL,
+    GreetingResult,
 )
 from app.ai.voice.agents.breeze_buddy.handlers.transport.eval_http import (
     NO_FIXTURE_STATUS,
@@ -67,6 +86,12 @@ from app.schemas.breeze_buddy.core import (
 )
 
 LEAD_ID = "11111111-1111-1111-1111-111111111111"
+EVAL_CONNECT = {
+    "label": "rtvi-ai",
+    "type": "client-message",
+    "id": "eval-connect",
+    "data": {"t": "eval-connect", "d": {"skip_tts": True}},
+}
 FIXTURES = [
     {
         "method": "GET",
@@ -304,6 +329,306 @@ async def test_a_sent_text_is_reported_once():
     assert calls == ["spoke"]
 
 
+# ── the greeting ─────────────────────────────────────────────────────────
+
+
+class FakeTask:
+    def __init__(self) -> None:
+        self.frames: List[Frame] = []
+
+    async def queue_frames(self, frames) -> None:
+        self.frames.extend(frames)
+
+
+async def test_the_greeting_reaches_the_harness_as_one_bot_response():
+    task = FakeTask()
+
+    await agent_utils.report_greeting_to_eval(cast(Any, task), "Namaste")
+
+    messages = [cast(OutputTransportMessageFrame, f).message for f in task.frames]
+    assert [m["type"] for m in messages] == [
+        "bot-llm-started",
+        "bot-llm-text",
+        "bot-llm-stopped",
+    ]
+    assert messages[1]["data"] == {"text": "Namaste"}
+
+
+def test_an_eval_greeting_is_resolved_never_synthesized(monkeypatch):
+    monkeypatch.setattr(
+        agent_utils, "resolve_initial_greeting", lambda template, payload: "Namaste"
+    )
+
+    result = agent_utils.resolve_eval_greeting(
+        make_lead(), cast(Any, SimpleNamespace())
+    )
+
+    assert result == GreetingResult(source="eval", text="Namaste")
+
+
+async def test_an_eval_session_sets_its_output_then_greets_after_the_flow(
+    monkeypatch,
+):
+    """skip_tts is set from the top of the pipeline, so the RTVI processor
+    agrees with the LLM, and the greeting is reported only once the flow's
+    context and tools are queued, so a harness that answers it at once
+    cannot interrupt the flow's setup."""
+    task = FakeTask()
+    flow_set_up = TextFrame("flow set up")
+
+    class FakeFlowManager:
+        _global_functions: List[Any] = []
+
+        async def initialize(self, node):
+            await task.queue_frames([flow_set_up])
+
+    agent = _eval_agent(FakeHarnessSocket(EVAL_CONNECT))
+    agent.task = cast(Any, task)
+    agent.lead = make_lead()
+    agent.template = cast(Any, SimpleNamespace(id="tpl-1", name="welcome"))
+    agent.flow_builder = cast(Any, object())
+    agent.flow_manager = cast(Any, FakeFlowManager())
+    greeting = GreetingResult(source="eval", text="Namaste")
+    monkeypatch.setattr(agent_mod, "resolve_eval_greeting", lambda *a: greeting)
+    monkeypatch.setattr(
+        agent_mod,
+        "build_flow_config",
+        lambda *a: ({"initial_node": "initial"}, [], None),
+    )
+    monkeypatch.setattr(agent_mod, "prepare_initial_node", lambda **kwargs: {})
+    monkeypatch.setattr(agent_mod, "spawn_prefill", lambda **kwargs: None)
+
+    await agent._handle_client_connected()
+
+    configure, *rest = task.frames
+    assert isinstance(configure, LLMConfigureOutputFrame) and configure.skip_tts
+    assert rest[0] is flow_set_up
+    assert [cast(OutputTransportMessageFrame, f).message["type"] for f in rest[1:]] == [
+        "bot-llm-started",
+        "bot-llm-text",
+        "bot-llm-stopped",
+    ]
+
+
+# ── who may attach ───────────────────────────────────────────────────────
+
+
+class FakeHarnessSocket:
+    """The harness's websocket: an eval-connect, then nothing."""
+
+    client_state = WebSocketState.CONNECTED
+
+    def __init__(self, opening: Dict[str, Any]) -> None:
+        self._opening = [json.dumps(opening)]
+        self.query_params: Dict[str, str] = {}
+        self.close_code: Optional[int] = None
+
+    async def accept(self) -> None:
+        return None
+
+    async def iter_text(self):
+        for message in self._opening:
+            yield message
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        self.close_code = code
+
+
+@pytest.fixture
+def eval_setup(monkeypatch):
+    """Everything _setup_eval_transport touches, patched where the agent looks
+    it up (no DB, Redis or TTS)."""
+    touched: List[str] = []
+    template = SimpleNamespace(
+        id="tpl-1",
+        name="welcome",
+        flow={},
+        configurations=None,
+        supported_channels=["voice"],
+    )
+
+    def lead_named(lead: LeadCallTracker):
+        async def get_lead_by_id(lead_id):
+            return lead
+
+        monkeypatch.setattr(agent_mod, "get_lead_by_id", get_lead_by_id)
+
+    async def mark_initiated(lead_id, when):
+        touched.append(lead_id)
+        return make_lead()
+
+    async def load_template(lead):
+        return template, None, {}
+
+    async def no_vad(**kwargs):
+        return None, None
+
+    monkeypatch.setattr(
+        agent_mod, "update_lead_call_initiated_time_by_id", mark_initiated
+    )
+    monkeypatch.setattr(agent_mod, "load_template_config", load_template)
+    monkeypatch.setattr(agent_mod, "create_vad_analyzer", no_vad)
+    return SimpleNamespace(lead_named=lead_named, touched=touched)
+
+
+def _eval_agent(ws: FakeHarnessSocket) -> agent_mod.Agent:
+    return agent_mod.Agent(
+        transport_type=TRANSPORT_TYPE_EVAL, ws=cast(WebSocket, ws), eval_lead_id=LEAD_ID
+    )
+
+
+async def test_an_eval_lead_gets_the_eval_transport(eval_setup):
+    eval_setup.lead_named(make_lead())
+    agent = _eval_agent(FakeHarnessSocket(EVAL_CONNECT))
+
+    assert await agent._setup_eval_transport() is True
+
+    assert eval_setup.touched == [LEAD_ID]
+    assert agent.call_sid == f"eval-{LEAD_ID}"
+    assert isinstance(agent.aiohttp_session, EvalHttp)
+    assert (
+        agent.aiohttp_session.respond("GET", "https://merchant.example.com/orders/1")[0]
+        == 200
+    )
+    assert type(agent.transport).__name__ == "EvalFastAPIWebsocketTransport"
+
+
+@pytest.mark.parametrize(
+    "mode", [ExecutionMode.TELEPHONY, ExecutionMode.TELEPHONY_TEST, ExecutionMode.DAILY]
+)
+async def test_any_other_lead_is_refused_before_it_is_touched(eval_setup, mode):
+    eval_setup.lead_named(make_lead(mode))
+    ws = FakeHarnessSocket(EVAL_CONNECT)
+
+    assert await _eval_agent(ws)._setup_eval_transport() is False
+
+    assert ws.close_code == 4003
+    assert eval_setup.touched == []
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"call_initiated_time": datetime(2026, 11, 19, tzinfo=timezone.utc)},
+        {"status": LeadCallStatus.FINISHED},
+    ],
+)
+async def test_a_lead_a_session_already_ran_is_refused(eval_setup, update):
+    eval_setup.lead_named(make_lead().model_copy(update=update))
+    ws = FakeHarnessSocket(EVAL_CONNECT)
+
+    assert await _eval_agent(ws)._setup_eval_transport() is False
+
+    assert ws.close_code == 4003
+    assert eval_setup.touched == []
+
+
+async def test_an_audio_mode_session_is_refused(eval_setup):
+    eval_setup.lead_named(make_lead())
+    audio = json.loads(json.dumps(EVAL_CONNECT))
+    audio["data"]["d"]["skip_tts"] = False
+    ws = FakeHarnessSocket(audio)
+
+    assert await _eval_agent(ws)._setup_eval_transport() is False
+
+    assert ws.close_code == 4003
+    assert eval_setup.touched == []
+
+
+async def test_a_carrier_stream_on_the_eval_route_is_refused(eval_setup):
+    eval_setup.lead_named(make_lead())
+    start = {"event": "start", "start": {"callId": "c1", "streamId": "s1"}}
+    ws = FakeHarnessSocket(start)
+
+    assert await _eval_agent(ws)._setup_eval_transport() is False
+
+    assert ws.close_code == 4003
+    assert eval_setup.touched == []
+
+
+# A lead marked started but left PROCESSING is closed by the stuck-call sweeper,
+# so every refusal must come before the lead is touched.
+
+
+async def test_a_bad_fixture_is_refused_before_the_lead_is_touched(eval_setup):
+    typo = {"eval": {"http": [{"url": "*", "response": {}}]}}
+    eval_setup.lead_named(make_lead().model_copy(update={"metaData": typo}))
+    ws = FakeHarnessSocket(EVAL_CONNECT)
+
+    assert await _eval_agent(ws)._setup_eval_transport() is False
+
+    assert ws.close_code == 4000
+    assert eval_setup.touched == []
+
+
+async def _missing_template(lead):
+    raise ValueError("no such template")
+
+
+@pytest.mark.parametrize("load", [_missing_template])
+async def test_a_template_it_cannot_run_is_refused_before_the_lead_is_touched(
+    eval_setup, monkeypatch, load
+):
+    eval_setup.lead_named(make_lead())
+    monkeypatch.setattr(agent_mod, "load_template_config", load)
+    ws = FakeHarnessSocket(EVAL_CONNECT)
+
+    assert await _eval_agent(ws)._setup_eval_transport() is False
+
+    assert ws.close_code == 4000
+    assert eval_setup.touched == []
+
+
+@pytest.mark.parametrize(
+    "started, status, closed",
+    [
+        (True, LeadCallStatus.PROCESSING, ["EARLY_HANGUP"]),
+        (True, LeadCallStatus.FINISHED, []),
+        (False, LeadCallStatus.PROCESSING, []),
+    ],
+)
+async def test_a_crash_closes_the_lead_only_if_it_started_and_is_still_open(
+    monkeypatch, started, status, closed
+):
+    completed: List[Dict[str, Any]] = []
+
+    async def complete(**kwargs):
+        completed.append(kwargs)
+
+    async def crash(self, runner_args=None):
+        if started:
+            self.lead = make_lead()
+            self.call_sid = self.lead.call_id
+        raise RuntimeError("pipeline died")
+
+    async def get_lead_by_id(lead_id):
+        return make_lead().model_copy(update={"status": status})
+
+    monkeypatch.setattr(agent_mod.Agent, "run", crash)
+    monkeypatch.setattr(agent_mod, "get_lead_by_id", get_lead_by_id)
+
+    with pytest.raises(RuntimeError, match="pipeline died"):
+        await agent_mod.eval_bot(
+            cast(WebSocket, FakeHarnessSocket(EVAL_CONNECT)), LEAD_ID, complete
+        )
+
+    assert [c["outcome"] for c in completed] == closed
+    assert all(c["call_id"] == f"eval-{LEAD_ID}" for c in completed)
+
+
+async def test_the_eval_transport_carries_the_connection_flags():
+    params = EvalTransportParams()
+    transport = await create_telephony_transport(
+        cast(WebSocket, FakeHarnessSocket(EVAL_CONNECT)),
+        params,
+        TRANSPORT_TYPE_EVAL,
+        CallData(body={"skip_tts": True}),
+    )
+
+    assert isinstance(params.serializer, EvalSerializer)
+    assert type(transport).__name__ == "EvalFastAPIWebsocketTransport"
+
+
 # ── side effects that must stay home ─────────────────────────────────────
 
 
@@ -318,6 +643,72 @@ async def test_an_eval_call_sends_no_alert(monkeypatch):
 
     assert result == {"status": "success"}
     send.assert_not_awaited()
+
+
+async def test_an_eval_call_records_its_requests_and_skips_the_evaluation_queue(
+    monkeypatch,
+):
+    from importlib import import_module
+
+    end_conversation_module = import_module(
+        "app.ai.voice.agents.breeze_buddy.handlers.internal.end_conversation"
+    )
+    enqueue = AsyncMock()
+    monkeypatch.setattr(
+        end_conversation_module, "enqueue_conversation_evaluation", enqueue
+    )
+    monkeypatch.setattr(
+        end_conversation_module, "update_span_with_evaluation_data", lambda _c: None
+    )
+
+    async def webhook(context, args):
+        context.aiohttp_session.respond("POST", "https://hooks.example.com/end")
+
+    # In production the callbacks run after the lead is saved; an eval runs them
+    # first, so the end-of-call webhook is among the requests it records.
+    monkeypatch.setitem(end_conversation_module.callback_map, "webhook", webhook)
+    http = EvalHttp(FIXTURES)
+    http.respond("GET", "https://merchant.example.com/orders/1")
+    lead = make_lead()
+    saved: Dict[str, Any] = {}
+
+    async def save(**kwargs):
+        # A DB write keeps what the lead held at that moment.
+        saved.update(copy.deepcopy(kwargs))
+        return lead.model_copy(update={"template_id": "tpl-1"})
+
+    completion = AsyncMock(side_effect=save)
+    bot = SimpleNamespace(
+        aiohttp_session=http,
+        approval_manager=None,
+        call_sid=lead.call_id,
+        completion_function=completion,
+        configurations=SimpleNamespace(knowledge_base=None),
+        context=SimpleNamespace(messages=[{"role": "user", "content": "busy hoon"}]),
+        conversation_ended=False,
+        end_conversation_callbacks=["webhook"],
+        errors=[],
+        lead=lead,
+        metrics_collector=None,
+        pending_transfer=None,
+        prior_generation_messages=[],
+        task=None,
+        template=SimpleNamespace(current_version=3),
+        transport_type=TRANSPORT_TYPE_EVAL,
+    )
+
+    await end_conversation_module.end_conversation(TemplateContext(cast(Any, bot)), {})
+
+    completion.assert_awaited_once()
+    meta = saved["meta_data"]
+    assert meta["template_version"] == 3
+    assert meta["eval"]["http_calls"] == http.calls
+    assert [c["url"] for c in meta["eval"]["http_calls"]] == [
+        "https://merchant.example.com/orders/1",
+        "https://hooks.example.com/end",
+    ]
+    assert meta["eval"]["scenario"] == "s/busy"
+    enqueue.assert_not_awaited()
 
 
 # The call list a merchant browses shows test calls, never eval sessions;
@@ -356,3 +747,20 @@ def test_a_pushed_lead_cannot_be_an_eval_lead():
         ).execution_mode
         == ExecutionMode.TELEPHONY_TEST
     )
+
+
+@pytest.mark.parametrize("worker_pod", [True, False])
+def test_the_eval_route_is_mounted_only_on_agent_tests_worker_pods(
+    monkeypatch, worker_pod
+):
+    """Test calls must never reach a pod that sets up or dials real calls."""
+    from app.api.routers import breeze_buddy
+    from app.core.config import static
+
+    try:
+        monkeypatch.setattr(static, "ENABLE_AGENT_TESTS_WORKER", worker_pod)
+        paths = {r.path for r in importlib.reload(breeze_buddy).router.routes}
+        assert any("/eval/" in path for path in paths) is worker_pod
+    finally:
+        monkeypatch.undo()
+        importlib.reload(breeze_buddy)
